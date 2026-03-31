@@ -52,6 +52,8 @@ Add to your MCP client config (e.g. Claude Code `~/.claude/settings.json`):
 | `check_imessage` | Check iMessage registration | read-only |
 | `check_facetime` | Check FaceTime registration | read-only |
 | `list_scheduled_messages` | List future messages | read-only |
+| `get_recent_messages` | Messages from last N minutes across all chats | read-only |
+| `get_unread_chats` | Chats with unread messages + their latest messages | read-only |
 | `get_attachment_info` | Attachment metadata | read-only |
 | `download_attachment` | Download attachment as base64 | read-only |
 | `mark_chat_read` | Send read receipt | idempotent, open-world |

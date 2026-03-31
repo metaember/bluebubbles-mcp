@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -158,6 +159,43 @@ async def get_chat_messages(
         chat_guid, limit=limit, offset=offset, sort=sort, after=after, before=before
     )
     return _fmt(data)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_recent_messages(
+    ctx: Context,
+    minutes: int = 60,
+    limit: int = 50,
+) -> str:
+    """Get recent messages across all chats within a time window.
+
+    Args:
+        minutes: How far back to look (default 60 minutes).
+        limit: Max messages to return (default 50).
+    """
+    after = int((time.time() - minutes * 60) * 1000)
+    data = await _bb(ctx).search_messages(after=after, limit=limit)
+    return _fmt(data)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
+    """Get all chats with unread messages, including their latest messages.
+
+    Args:
+        message_limit: Number of recent messages to include per unread chat (default 5).
+    """
+    bb = _bb(ctx)
+    chats = await bb.list_chats(limit=100, with_fields=["lastmessage"])
+    unread = [c for c in chats if c.get("hasUnreadMessages")]
+    results = []
+    for chat in unread:
+        messages = await bb.get_chat_messages(chat["guid"], limit=message_limit)
+        results.append({
+            "chat": chat,
+            "recent_messages": messages,
+        })
+    return _fmt(results)
 
 
 @mcp.tool(annotations=ToolAnnotations(
