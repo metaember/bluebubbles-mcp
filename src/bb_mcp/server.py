@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from contextlib import asynccontextmanager
@@ -186,6 +187,39 @@ async def mark_chat_unread(ctx: Context, chat_guid: str) -> str:
     return "Chat marked as unread."
 
 
+@mcp.tool(annotations=SEND)
+async def start_typing(ctx: Context, chat_guid: str) -> str:
+    """Show a typing indicator in a chat (visible to the other person).
+
+    Args:
+        chat_guid: The chat GUID.
+    """
+    await _bb(ctx).start_typing(chat_guid)
+    return "Typing indicator started."
+
+
+@mcp.tool(annotations=SEND)
+async def stop_typing(ctx: Context, chat_guid: str) -> str:
+    """Stop the typing indicator in a chat.
+
+    Args:
+        chat_guid: The chat GUID.
+    """
+    await _bb(ctx).stop_typing(chat_guid)
+    return "Typing indicator stopped."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def delete_chat(ctx: Context, chat_guid: str) -> str:
+    """Delete an entire chat conversation. This is irreversible.
+
+    Args:
+        chat_guid: The chat GUID to delete.
+    """
+    await _bb(ctx).delete_chat(chat_guid)
+    return "Chat deleted."
+
+
 # ---------------------------------------------------------------------------
 # Messages
 # ---------------------------------------------------------------------------
@@ -345,6 +379,17 @@ async def check_imessage(ctx: Context, address: str) -> str:
     return _fmt(data)
 
 
+@mcp.tool(annotations=READ_ONLY)
+async def check_facetime(ctx: Context, address: str) -> str:
+    """Check if a phone number or email is registered for FaceTime.
+
+    Args:
+        address: Phone number or email to check.
+    """
+    data = await _bb(ctx).check_facetime_availability(address)
+    return _fmt(data)
+
+
 # ---------------------------------------------------------------------------
 # Group chat management
 # ---------------------------------------------------------------------------
@@ -451,6 +496,44 @@ async def get_attachment_info(ctx: Context, attachment_guid: str) -> str:
         attachment_guid: The attachment GUID.
     """
     data = await _bb(ctx).get_attachment(attachment_guid)
+    return _fmt(data)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def download_attachment(ctx: Context, attachment_guid: str) -> str:
+    """Download an attachment and return it as base64-encoded data.
+
+    Args:
+        attachment_guid: The attachment GUID.
+    """
+    data = await _bb(ctx).download_attachment(attachment_guid)
+    meta = await _bb(ctx).get_attachment(attachment_guid)
+    return _fmt({
+        "filename": meta.get("transferName"),
+        "mime_type": meta.get("mimeType"),
+        "size_bytes": len(data),
+        "data_base64": base64.b64encode(data).decode(),
+    })
+
+
+@mcp.tool(annotations=SEND)
+async def send_attachment(
+    ctx: Context,
+    chat_guid: str,
+    data_base64: str,
+    filename: str,
+    mime_type: str = "application/octet-stream",
+) -> str:
+    """Send a file attachment to a chat.
+
+    Args:
+        chat_guid: The chat GUID to send to.
+        data_base64: The file contents as a base64-encoded string.
+        filename: The filename (e.g. 'photo.jpg').
+        mime_type: MIME type (e.g. 'image/jpeg'). Defaults to 'application/octet-stream'.
+    """
+    file_data = base64.b64decode(data_base64)
+    data = await _bb(ctx).send_attachment(chat_guid, file_data, filename, mime_type)
     return _fmt(data)
 
 

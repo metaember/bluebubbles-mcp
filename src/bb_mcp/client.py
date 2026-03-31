@@ -290,6 +290,31 @@ class BlueBubblesClient:
         resp.raise_for_status()
         return resp.content
 
+    async def send_attachment(
+        self,
+        chat_guid: str,
+        file_data: bytes,
+        filename: str,
+        mime_type: str = "application/octet-stream",
+        method: str = "private-api",
+    ) -> dict[str, Any]:
+        resp = await self._http.post(
+            self._url("/message/attachment"),
+            params=self._auth_params(),
+            data={
+                "chatGuid": chat_guid,
+                "tempGuid": f"temp-{uuid.uuid4().hex}",
+                "method": method,
+                "name": filename,
+            },
+            files={"attachment": (filename, file_data, mime_type)},
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("status") and body["status"] >= 400:
+            raise BlueBubblesError(body.get("message", "Unknown error"), body)
+        return body.get("data")
+
     # -- scheduled messages ---------------------------------------------------
 
     async def list_scheduled_messages(self) -> list[dict[str, Any]]:
