@@ -1,0 +1,8 @@
+services:
+  bluebubbles-mcp:
+    build: .
+    image: bluebubbles-mcp:latest
+    stdin_open: true
+    environment:
+      BLUEBUBBLES_URL: ${BLUEBUBBLES_URL}
+      BLUEBUBBLES_PASSWORD: ${BLUEBUBBLES_PASSWORD}
