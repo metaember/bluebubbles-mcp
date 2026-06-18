@@ -13,6 +13,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
 from bb_mcp.client import BlueBubblesClient, BlueBubblesError
+from bb_mcp.policy import Allowlist, Guard
 
 # ---------------------------------------------------------------------------
 # Annotations
@@ -60,8 +61,10 @@ async def lifespan(server: FastMCP):
             "BLUEBUBBLES_URL and BLUEBUBBLES_PASSWORD environment variables are required"
         )
     client = BlueBubblesClient(url, password)
+    allowlist = Allowlist.from_env(os.environ, "BLUEBUBBLES_WRITE_ALLOWLIST")
+    guard = Guard(allowlist, client)
     try:
-        yield {"bb": client}
+        yield {"bb": client, "guard": guard}
     finally:
         await client.close()
 
@@ -79,6 +82,10 @@ mcp = FastMCP(
 
 def _bb(ctx: Context) -> BlueBubblesClient:
     return ctx.request_context.lifespan_context["bb"]
+
+
+def _guard(ctx: Context) -> Guard:
+    return ctx.request_context.lifespan_context["guard"]
 
 
 def _fmt(data: Any) -> str:
@@ -214,6 +221,7 @@ async def mark_chat_read(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The chat GUID.
     """
+    await _guard(ctx).check_chat(chat_guid)
     await _bb(ctx).mark_chat_read(chat_guid)
     return "Chat marked as read."
 
@@ -225,6 +233,7 @@ async def mark_chat_unread(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The chat GUID.
     """
+    await _guard(ctx).check_chat(chat_guid)
     await _bb(ctx).mark_chat_unread(chat_guid)
     return "Chat marked as unread."
 
@@ -236,6 +245,7 @@ async def start_typing(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The chat GUID.
     """
+    await _guard(ctx).check_chat(chat_guid)
     await _bb(ctx).start_typing(chat_guid)
     return "Typing indicator started."
 
@@ -247,6 +257,7 @@ async def stop_typing(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The chat GUID.
     """
+    await _guard(ctx).check_chat(chat_guid)
     await _bb(ctx).stop_typing(chat_guid)
     return "Typing indicator stopped."
 
@@ -258,6 +269,7 @@ async def delete_chat(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The chat GUID to delete.
     """
+    await _guard(ctx).check_chat(chat_guid)
     await _bb(ctx).delete_chat(chat_guid)
     return "Chat deleted."
 
@@ -281,6 +293,7 @@ async def send_message(
         message: The message text.
         reply_to_guid: Optional message GUID to reply to (creates a thread).
     """
+    await _guard(ctx).check_chat(chat_guid)
     data = await _bb(ctx).send_message(chat_guid, message, reply_to_guid=reply_to_guid)
     return _fmt(data)
 
@@ -299,6 +312,7 @@ async def send_message_to_address(
         message: The message text.
         service: 'iMessage' or 'SMS' (default iMessage).
     """
+    _guard(ctx).check_address(address)
     data = await _bb(ctx).send_message_to_address(address, message, service=service)
     return _fmt(data)
 
@@ -318,10 +332,14 @@ async def send_reaction(
         reaction: One of: love, like, dislike, laugh, emphasize, question.
                   Prefix with '-' to remove (e.g. '-love').
     """
+    await _guard(ctx).check_chat(chat_guid)
     data = await _bb(ctx).send_reaction(chat_guid, message_guid, reaction)
     return _fmt(data)
 
 
+# Note: edit_message/unsend_message take a message GUID, not a recipient, so the
+# write allowlist isn't applied here — they only act on an already-sent message
+# (which passed the allowlist at send time) and can't reach a new recipient.
 @mcp.tool(annotations=SEND)
 async def edit_message(
     ctx: Context,
@@ -445,6 +463,7 @@ async def rename_group(ctx: Context, chat_guid: str, name: str) -> str:
         chat_guid: The group chat GUID.
         name: New display name for the group.
     """
+    await _guard(ctx).check_chat(chat_guid)
     data = await _bb(ctx).rename_group(chat_guid, name)
     return _fmt(data)
 
@@ -457,6 +476,9 @@ async def add_participant(ctx: Context, chat_guid: str, address: str) -> str:
         chat_guid: The group chat GUID.
         address: Phone number or email of the person to add.
     """
+    guard = _guard(ctx)
+    await guard.check_chat(chat_guid)
+    guard.check_address(address)  # the new member becomes a recipient too
     data = await _bb(ctx).add_participant(chat_guid, address)
     return _fmt(data)
 
@@ -469,6 +491,7 @@ async def remove_participant(ctx: Context, chat_guid: str, address: str) -> str:
         chat_guid: The group chat GUID.
         address: Phone number or email of the person to remove.
     """
+    await _guard(ctx).check_chat(chat_guid)
     data = await _bb(ctx).remove_participant(chat_guid, address)
     return _fmt(data)
 
@@ -480,6 +503,7 @@ async def leave_chat(ctx: Context, chat_guid: str) -> str:
     Args:
         chat_guid: The group chat GUID to leave.
     """
+    await _guard(ctx).check_chat(chat_guid)
     data = await _bb(ctx).leave_chat(chat_guid)
     return "Left the group chat."
 
@@ -510,6 +534,7 @@ async def schedule_message(
         message: The message text.
         scheduled_for: When to send, as epoch milliseconds.
     """
+    await _guard(ctx).check_chat(chat_guid)
     data = await _bb(ctx).create_scheduled_message(chat_guid, message, scheduled_for)
     return _fmt(data)
 
@@ -574,6 +599,7 @@ async def send_attachment(
         filename: The filename (e.g. 'photo.jpg').
         mime_type: MIME type (e.g. 'image/jpeg'). Defaults to 'application/octet-stream'.
     """
+    await _guard(ctx).check_chat(chat_guid)
     file_data = base64.b64decode(data_base64)
     data = await _bb(ctx).send_attachment(chat_guid, file_data, filename, mime_type)
     return _fmt(data)
