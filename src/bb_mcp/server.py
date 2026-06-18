@@ -70,6 +70,10 @@ mcp = FastMCP(
     "BlueBubbles",
     instructions="iMessage bridge via BlueBubbles",
     lifespan=lifespan,
+    # host/port only matter for HTTP transport; see main(). Defaults to loopback
+    # so HTTP mode isn't exposed by accident; the Docker image sets 0.0.0.0.
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8000")),
 )
 
 
@@ -579,5 +583,16 @@ async def send_attachment(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def main() -> None:
+    """Run the server.
+
+    Defaults to stdio. Set MCP_TRANSPORT=streamable-http to serve over HTTP
+    instead, on MCP_HOST:MCP_PORT at path /mcp (default 127.0.0.1:8000) — useful
+    for running as a container that an HTTP-capable MCP client connects to.
+    """
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    main()

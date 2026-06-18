@@ -74,6 +74,39 @@ Add to your MCP client config (e.g. Claude Code `~/.claude/settings.json`):
 | `delete_chat` | Delete a conversation | destructive, open-world |
 | `delete_scheduled_message` | Cancel scheduled message | destructive, open-world |
 
+## Run over HTTP (Docker)
+
+The server speaks stdio by default. Set `MCP_TRANSPORT=streamable-http` to serve
+over [Streamable HTTP](https://modelcontextprotocol.io) instead, so any
+HTTP-capable MCP client can connect at `http://<host>:8000/mcp`. The Docker image
+sets this for you.
+
+```sh
+docker build -t bluebubbles-mcp .
+docker run --rm -e BLUEBUBBLES_URL -e BLUEBUBBLES_PASSWORD -p 8000:8000 bluebubbles-mcp
+```
+
+As a Compose service — credentials live in this container's own environment (an
+`env_file` or Docker secrets), so they stay isolated to this tool:
+
+```yaml
+services:
+  bluebubbles-mcp:
+    build: .
+    environment:
+      BLUEBUBBLES_URL: ${BLUEBUBBLES_URL}
+      BLUEBUBBLES_PASSWORD: ${BLUEBUBBLES_PASSWORD}
+    restart: unless-stopped
+```
+
+Notes:
+- The HTTP endpoint is unauthenticated, so don't expose it publicly — keep it on a
+  private/internal network (and drop the published `ports:` if a co-located client
+  reaches it over the Compose network).
+- `BLUEBUBBLES_URL` must be reachable **from inside the container** — use a
+  hostname/IP the container can resolve (e.g. the BlueBubbles host's LAN address or
+  `host.docker.internal`), not `localhost`.
+
 ## License
 
 MIT
