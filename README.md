@@ -36,6 +36,32 @@ Add to your MCP client config (e.g. Claude Code `~/.claude/settings.json`):
 }
 ```
 
+### Restricting write recipients (allowlist)
+
+By default the server can message anyone. Set `BLUEBUBBLES_WRITE_ALLOWLIST` to a
+comma-separated list of phone numbers and/or emails to restrict **every write**
+(send, reaction, attachment, typing, scheduling, group edits, delete/leave) to
+those recipients. It is enforced server-side, so an MCP client — including one
+reaching the HTTP transport — cannot bypass it.
+
+```jsonc
+"BLUEBUBBLES_WRITE_ALLOWLIST": "+15551234567, partner@example.com",
+"BLUEBUBBLES_ALLOWLIST_REGION": "US"  // optional, default region for parsing local numbers
+```
+
+Behavior:
+
+- **Unset** → unrestricted (backward compatible). **Set but empty** (`""`) → deny
+  all, a safe failure mode.
+- Numbers are matched in normalized E.164 form, so `(555) 123-4567` and
+  `+15551234567` are equivalent; emails match case-insensitively.
+- For a **group chat**, *every* participant must be on the list or the write is
+  blocked. A chat whose participants can't be resolved is denied (fail-closed).
+- Read tools are **not** restricted, and the message-GUID writes
+  (`edit_message`, `unsend_message`) aren't covered — they only act on an
+  already-sent message and can't reach a new recipient. A
+  `BLUEBUBBLES_READ_ALLOWLIST` may be added later.
+
 ## Tools
 
 | Tool | Description | Annotations |
