@@ -123,16 +123,22 @@ class ContactResolver:
                 self._remember(contact)
             for a in missing:  # cache misses so we don't requery them
                 self._cache.setdefault(self.normalize(a), None)
-        return {a: self._cache[self.normalize(a)] for a in wanted if self._cache.get(self.normalize(a))}
+        result: dict[str, str] = {}
+        for a in wanted:
+            name = self._cache.get(self.normalize(a))
+            if name:
+                result[a] = name
+        return result
 
     async def all_contacts(self) -> list[dict[str, Any]]:
         """Fetch (once) and cache the full contact list, warming the name cache."""
         if self._all_contacts is None:
             try:
-                self._all_contacts = await self._client.get_contacts() or []
+                contacts = await self._client.get_contacts() or []
             except Exception:  # noqa: BLE001
-                self._all_contacts = []
-            for contact in self._all_contacts:
+                return []  # transient failure — don't cache, retry next call
+            self._all_contacts = contacts
+            for contact in contacts:
                 self._remember(contact)
         return self._all_contacts
 

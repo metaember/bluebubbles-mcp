@@ -165,3 +165,16 @@ class TestResolverFind:
         await resolver.find("alice")
         await resolver.find("bob")
         assert route.call_count == 1
+
+    async def test_failure_is_not_cached_and_retries(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        # A transient /contact failure must not poison find() for the session.
+        route = mock_api.get(f"{API}/contact").mock(
+            side_effect=[httpx.Response(500, json={"status": 500}), ok_json([ALICE])]
+        )
+        resolver = ContactResolver(client)
+        assert await resolver.find("alice") == []  # transient failure -> empty
+        matches = await resolver.find("alice")  # retried, now succeeds
+        assert [contact_display_name(c) for c in matches] == ["Alice Smith"]
+        assert route.call_count == 2
