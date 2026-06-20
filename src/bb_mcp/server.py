@@ -29,6 +29,7 @@ from bb_mcp.contacts import (
     inject_names,
 )
 from bb_mcp.policy import DEFAULT_REGION, Allowlist, Guard
+from bb_mcp.projection import filter_by_sender, project
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,52 @@ async def _enrich(ctx: Context, data: Any) -> Any:
     return inject_names(data, names) if names else data
 
 
+def _my_address(ctx: Context) -> str | None:
+    return ctx.request_context.lifespan_context.get("my_address")
+
+
+def _resolve_from(ctx: Context, from_address: str) -> str:
+    """Resolve a from_address filter, translating 'me' to the user's address."""
+    if from_address.strip().lower() == "me":
+        me = _my_address(ctx)
+        if not me:
+            raise ValueError(
+                "Can't resolve 'me': the server didn't report your address. "
+                "Set BLUEBUBBLES_MY_ADDRESS, or pass an explicit phone/email."
+            )
+        return me
+    return from_address
+
+
+async def _present(ctx: Context, data: Any, *, extended: bool) -> str:
+    """Enrich with contact names, then compact (unless extended), then format."""
+    return _fmt(project(await _enrich(ctx, data), extended))
+
+
+async def _present_messages(
+    ctx: Context,
+    messages: Any,
+    *,
+    extended: bool,
+    from_address: str | None,
+    limit: int,
+) -> str:
+    """Like _present, but for a flat message list — also applies sender filter."""
+    messages = await _enrich(ctx, messages)
+    if from_address and isinstance(messages, list):
+        resolver = _contacts(ctx)
+        target = resolver.normalize(_resolve_from(ctx, from_address))
+        messages = filter_by_sender(
+            messages, target, _my_address(ctx), resolver.normalize
+        )[:limit]
+    return _fmt(project(messages, extended))
+
+
+def _fetch_limit(limit: int, from_address: str | None) -> int:
+    """Widen the fetch when filtering by sender so results aren't starved."""
+    return min(max(limit, 200), 1000) if from_address else limit
+
+
 def _fmt(data: Any) -> str:
     """Format API response data as readable JSON."""
     return json.dumps(data, indent=2, default=str, ensure_ascii=False)
@@ -234,28 +281,31 @@ async def list_chats(
     ctx: Context,
     limit: int = 25,
     offset: int = 0,
+    extended: bool = False,
 ) -> str:
     """List iMessage conversations, sorted by most recent activity.
 
     Args:
         limit: Max number of chats to return (default 25).
         offset: Pagination offset.
+        extended: Return full raw fields instead of the compact set (default False).
     """
     data = await _bb(ctx).list_chats(
         limit=limit, offset=offset, with_fields=["lastmessage"]
     )
-    return _fmt(await _enrich(ctx, data))
+    return await _present(ctx, data, extended=extended)
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_chat(ctx: Context, chat_guid: str) -> str:
+async def get_chat(ctx: Context, chat_guid: str, extended: bool = False) -> str:
     """Get details for a specific chat, including participants.
 
     Args:
         chat_guid: The chat GUID (e.g. 'iMessage;-;+15551234567' or 'iMessage;+;chat123').
+        extended: Return full raw fields instead of the compact set (default False).
     """
     data = await _bb(ctx).get_chat(chat_guid, with_fields=["participants", "lastmessage"])
-    return _fmt(await _enrich(ctx, data))
+    return await _present(ctx, data, extended=extended)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -267,6 +317,8 @@ async def get_chat_messages(
     sort: str = "DESC",
     after: int | None = None,
     before: int | None = None,
+    from_address: str | None = None,
+    extended: bool = False,
 ) -> str:
     """Get messages from a specific chat.
 
@@ -277,11 +329,21 @@ async def get_chat_messages(
         sort: 'ASC' or 'DESC' (default DESC = newest first).
         after: Only messages after this epoch-ms timestamp.
         before: Only messages before this epoch-ms timestamp.
+        from_address: Only messages sent by this phone/email. Pass 'me' for the
+            user's own messages.
+        extended: Return full raw fields instead of the compact set (default False).
     """
     data = await _bb(ctx).get_chat_messages(
-        chat_guid, limit=limit, offset=offset, sort=sort, after=after, before=before
+        chat_guid,
+        limit=_fetch_limit(limit, from_address),
+        offset=offset,
+        sort=sort,
+        after=after,
+        before=before,
     )
-    return _fmt(await _enrich(ctx, data))
+    return await _present_messages(
+        ctx, data, extended=extended, from_address=from_address, limit=limit
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -289,24 +351,36 @@ async def get_recent_messages(
     ctx: Context,
     minutes: int = 60,
     limit: int = 50,
+    from_address: str | None = None,
+    extended: bool = False,
 ) -> str:
     """Get recent messages across all chats within a time window.
 
     Args:
         minutes: How far back to look (default 60 minutes).
         limit: Max messages to return (default 50).
+        from_address: Only messages sent by this phone/email. Pass 'me' for the
+            user's own messages.
+        extended: Return full raw fields instead of the compact set (default False).
     """
     after = int((time.time() - minutes * 60) * 1000)
-    data = await _bb(ctx).search_messages(after=after, limit=limit)
-    return _fmt(await _enrich(ctx, data))
+    data = await _bb(ctx).search_messages(
+        after=after, limit=_fetch_limit(limit, from_address)
+    )
+    return await _present_messages(
+        ctx, data, extended=extended, from_address=from_address, limit=limit
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
+async def get_unread_chats(
+    ctx: Context, message_limit: int = 5, extended: bool = False
+) -> str:
     """Get all chats with unread messages, including their latest messages.
 
     Args:
         message_limit: Number of recent messages to include per unread chat (default 5).
+        extended: Return full raw fields instead of the compact set (default False).
     """
     bb = _bb(ctx)
     chats = await bb.list_chats(limit=100, with_fields=["lastmessage"])
@@ -318,7 +392,7 @@ async def get_unread_chats(ctx: Context, message_limit: int = 5) -> str:
             "chat": chat,
             "recent_messages": messages,
         })
-    return _fmt(await _enrich(ctx, results))
+    return await _present(ctx, results, extended=extended)
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -579,6 +653,8 @@ async def search_messages(
     offset: int = 0,
     after: int | None = None,
     before: int | None = None,
+    from_address: str | None = None,
+    extended: bool = False,
 ) -> str:
     """Search messages by text content and/or filter by chat and time range.
 
@@ -589,23 +665,31 @@ async def search_messages(
         offset: Pagination offset.
         after: Only messages after this epoch-ms timestamp.
         before: Only messages before this epoch-ms timestamp.
+        from_address: Only messages sent by this phone/email. Pass 'me' for the
+            user's own messages.
+        extended: Return full raw fields instead of the compact set (default False).
     """
     data = await _bb(ctx).search_messages(
-        query=query, chat_guid=chat_guid, limit=limit, offset=offset,
-        after=after, before=before,
+        query=query, chat_guid=chat_guid, limit=_fetch_limit(limit, from_address),
+        offset=offset, after=after, before=before,
     )
-    return _fmt(await _enrich(ctx, data))
+    return await _present_messages(
+        ctx, data, extended=extended, from_address=from_address, limit=limit
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def get_message(ctx: Context, message_guid: str) -> str:
+async def get_message(
+    ctx: Context, message_guid: str, extended: bool = False
+) -> str:
     """Get a single message by its GUID, including chat and attachment info.
 
     Args:
         message_guid: The message GUID.
+        extended: Return full raw fields instead of the compact set (default False).
     """
     data = await _bb(ctx).get_message(message_guid)
-    return _fmt(await _enrich(ctx, data))
+    return await _present(ctx, data, extended=extended)
 
 
 # ---------------------------------------------------------------------------

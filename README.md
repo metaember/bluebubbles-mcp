@@ -117,6 +117,20 @@ Disable it (for leaner responses or if your contact DB is slow) with:
 
 `find_contact` / `find_chats` still work when this is off — they're explicit.
 
+### Compact responses & sender filtering
+
+Message reads return a **compact projection by default** — the fields an
+assistant needs (`guid`, `text`, `handle` + `contactName`, `isFromMe`,
+timestamps, attachment names, reaction/reply linkage) instead of the full raw
+BlueBubbles objects, which cuts token usage substantially. Pass `extended=true`
+on any read tool to get the complete raw fields.
+
+Message reads (`get_chat_messages`, `search_messages`, `get_recent_messages`)
+also accept **`from_address`** to filter by who sent each message — pass a phone
+number / email, or `"me"` for the user's own messages. Filtering is by true
+sender (the user when `isFromMe`, otherwise the message's handle), so it's
+correct in both 1:1 and group chats.
+
 ## Tools
 
 | Tool | Description | Annotations |
