@@ -39,6 +39,7 @@ PRIVATE_API_TOOLS: tuple[str, ...] = (
     "add_participant",
     "remove_participant",
     "leave_chat",
+    "create_group_chat",  # AppleScript can't create groups on Big Sur+
     "check_imessage",     # handle availability lookups go through the Private API
     "check_facetime",
     "send_multipart",     # needs /attachment/upload (Private API)

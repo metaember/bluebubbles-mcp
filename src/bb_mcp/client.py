@@ -33,15 +33,20 @@ class BlueBubblesClient:
             params.update(extra)
         return params
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        resp = await self._http.get(
-            self._url(path), params=self._auth_params(params)
-        )
+    @staticmethod
+    def _unwrap(resp: httpx.Response) -> Any:
+        """Raise on HTTP/API errors, else return the response's ``data`` field."""
         resp.raise_for_status()
         body = resp.json()
         if body.get("status") and body["status"] >= 400:
             raise BlueBubblesError(body.get("message", "Unknown error"), body)
         return body.get("data")
+
+    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        resp = await self._http.get(
+            self._url(path), params=self._auth_params(params)
+        )
+        return self._unwrap(resp)
 
     async def _post(
         self, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None
@@ -49,21 +54,13 @@ class BlueBubblesClient:
         resp = await self._http.post(
             self._url(path), json=json, params=self._auth_params(params)
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._unwrap(resp)
 
     async def _delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
         resp = await self._http.delete(
             self._url(path), params=self._auth_params(params)
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._unwrap(resp)
 
     async def _put(
         self, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None
@@ -71,11 +68,7 @@ class BlueBubblesClient:
         resp = await self._http.put(
             self._url(path), json=json, params=self._auth_params(params)
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._unwrap(resp)
 
     # -- server ---------------------------------------------------------------
 
@@ -187,11 +180,7 @@ class BlueBubblesClient:
             params=self._auth_params(),
             files={"icon": (filename, file_data, mime_type)},
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._unwrap(resp)
 
     async def remove_group_icon(self, chat_guid: str) -> Any:
         return await self._delete(f"/chat/{chat_guid}/icon")
@@ -277,11 +266,7 @@ class BlueBubblesClient:
             params=self._auth_params(),
             files={"attachment": (filename, file_data, mime_type)},
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._unwrap(resp)
 
     async def send_reaction(
         self,
@@ -414,11 +399,7 @@ class BlueBubblesClient:
             },
             files={"attachment": (filename, file_data, mime_type)},
         )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
-        return body.get("data")
+        return self._unwrap(resp)
 
     # -- scheduled messages ---------------------------------------------------
 

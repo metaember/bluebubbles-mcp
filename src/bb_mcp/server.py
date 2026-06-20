@@ -531,6 +531,11 @@ async def create_group_chat(
         message: The opening message (required to create the chat).
         service: 'iMessage' or 'SMS' (default iMessage).
     """
+    if service.upper() == "SMS" and not _private_api(ctx):
+        raise ValueError(
+            "Creating an SMS group requires the BlueBubbles Private API, which "
+            "isn't enabled on this server. Use service='iMessage'."
+        )
     guard = _guard(ctx)
     for address in addresses:
         guard.check_address(address)
@@ -561,7 +566,7 @@ async def send_multipart(
     await _guard(ctx).check_chat(chat_guid)
     assembled: list[dict[str, Any]] = []
     for index, part in enumerate(parts):
-        if part.get("text") is not None:
+        if part.get("text"):
             assembled.append({"partIndex": index, "text": part["text"]})
         elif part.get("data_base64"):
             filename = part.get("filename") or f"attachment-{index}"
