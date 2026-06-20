@@ -62,41 +62,112 @@ Behavior:
   already-sent message and can't reach a new recipient. A
   `BLUEBUBBLES_READ_ALLOWLIST` may be added later.
 
+### Private API vs AppleScript
+
+BlueBubbles can drive Messages two ways. **AppleScript** works on any install
+with no extra setup but only sends plain texts/attachments. The **[Private
+API](https://docs.bluebubbles.app/private-api/installation)** (requires the
+BlueBubbles Helper + partially disabled SIP) additionally unlocks tapbacks,
+edit/unsend, typing indicators, read receipts, group management, threaded
+replies, and SMS sending.
+
+On startup the server reads `/server/info` and adapts itself to what's actually
+available:
+
+- **Sends** use the Private API when present, and fall back to AppleScript when
+  not — so `send_message` works on a bare install instead of erroring.
+- **Tools that require the Private API** (reactions, edit/unsend, typing,
+  read receipts, group management, iMessage/FaceTime availability checks) are
+  **hidden from the tool list** when it's unavailable, so a client never sees a
+  tool that could only fail.
+
+Override the auto-detection with `BLUEBUBBLES_PRIVATE_API`:
+
+```jsonc
+"BLUEBUBBLES_PRIVATE_API": "auto"   // default: introspect /server/info
+// "true"  — force-enable (assume the Private API is set up)
+// "false" — force-disable (AppleScript only; hide Private API tools)
+```
+
+If `/server/info` can't be read at startup, detection fails open (assumes the
+Private API is available) so a transient blip doesn't hide half the toolset.
+
+The same `/server/info` read also discovers the user's own iMessage address,
+surfaced by the `get_my_address` tool. Override it if detection is wrong or you
+run multiple handles:
+
+```jsonc
+"BLUEBUBBLES_MY_ADDRESS": "+15551234567"  // or you@icloud.com
+```
+
+### Contact names
+
+Message and chat data from BlueBubbles carries raw phone numbers and emails, not
+names. To save the model from constantly cross-referencing numbers, read
+responses are **enriched with a `contactName`** beside each handle, and
+`find_contact` / `find_chats` let it reach people by name instead of number.
+
+Resolution is lazy and cached per session: a response's addresses are looked up
+in a single batched `/contact/query` the first time they're seen, then reused.
+Disable it (for leaner responses or if your contact DB is slow) with:
+
+```jsonc
+"BLUEBUBBLES_RESOLVE_NAMES": "false"  // default: enabled
+```
+
+`find_contact` / `find_chats` still work when this is off — they're explicit.
+
 ## Tools
 
 | Tool | Description | Annotations |
 |------|-------------|-------------|
 | `ping` | Check server connectivity | read-only |
 | `get_server_info` | Server info and health | read-only |
+| `get_my_address` | The user's own iMessage address (to identify their own messages) | read-only |
 | `list_chats` | List conversations by recent activity | read-only |
 | `get_chat` | Chat details with participants | read-only |
 | `get_chat_messages` | Messages from a chat | read-only |
 | `search_messages` | Search by text, chat, time range | read-only |
 | `get_message` | Single message by GUID | read-only |
 | `get_contacts` | All contacts | read-only |
-| `lookup_contact` | Look up by phone/email | read-only |
+| `lookup_contact` | Look up name by phone/email | read-only |
+| `find_contact` | Find contacts by name (phone/email unknown) | read-only |
+| `find_chats` | Find chats involving a contact by name | read-only |
 | `check_imessage` | Check iMessage registration | read-only |
 | `check_facetime` | Check FaceTime registration | read-only |
+| `query_handles` | List/search known handles | read-only |
+| `get_handle` | Get a handle by address | read-only |
+| `get_focus_status` | Contact's Focus / Do Not Disturb status | read-only |
+| `find_my_devices` | Find My — your devices' locations | read-only |
+| `find_my_friends` | Find My — friends' locations | read-only |
 | `list_scheduled_messages` | List future messages | read-only |
+| `get_scheduled_message` | Get one scheduled message by ID | read-only |
 | `get_recent_messages` | Messages from last N minutes across all chats | read-only |
 | `get_unread_chats` | Chats with unread messages + their latest messages | read-only |
 | `get_attachment_info` | Attachment metadata | read-only |
 | `download_attachment` | Download attachment as base64 | read-only |
+| `get_group_icon` | Download a group chat's icon | read-only |
 | `mark_chat_read` | Send read receipt | idempotent, open-world |
 | `mark_chat_unread` | Mark chat unread (local) | idempotent |
 | `rename_group` | Rename a group chat | idempotent |
+| `set_group_icon` | Set a group chat's icon | idempotent |
 | `start_typing` | Show typing indicator | open-world |
 | `stop_typing` | Stop typing indicator | open-world |
 | `send_message` | Send to existing chat | open-world |
 | `send_message_to_address` | Send to phone/email | open-world |
+| `create_group_chat` | Create a group chat + first message | open-world |
 | `send_attachment` | Send a file attachment | open-world |
+| `send_multipart` | Send text + attachments as one message | open-world |
 | `send_reaction` | Tapback reaction | open-world |
 | `edit_message` | Edit a sent message | open-world |
 | `schedule_message` | Schedule a future message | open-world |
+| `update_scheduled_message` | Update a scheduled message | open-world |
 | `add_participant` | Add to group chat | open-world |
 | `unsend_message` | Retract a message | destructive, open-world |
 | `remove_participant` | Remove from group chat | destructive, open-world |
 | `leave_chat` | Leave a group chat | destructive, open-world |
+| `remove_group_icon` | Remove a group chat's icon | destructive, open-world |
+| `delete_message` | Delete a single message | destructive, open-world |
 | `delete_chat` | Delete a conversation | destructive, open-world |
 | `delete_scheduled_message` | Cancel scheduled message | destructive, open-world |
 

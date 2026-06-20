@@ -583,3 +583,145 @@ class TestBlueBubblesError:
         body = {"status": 500}
         err = BlueBubblesError(body.get("message", "Unknown error"), body)
         assert str(err) == "Unknown error"
+
+
+# ===========================================================================
+# Newly added endpoints (Find My, multipart, handles, icons, scheduled CRUD)
+# ===========================================================================
+
+import json
+
+
+class TestScheduledMessages:
+    async def test_create_sends_typed_payload(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/schedule").mock(return_value=ok_json({}))
+        await client.create_scheduled_message("g1", "hi", 1999999999000, method="apple-script")
+        assert json.loads(route.calls[0].request.content) == {
+            "type": "send-message",
+            "payload": {"chatGuid": "g1", "message": "hi", "method": "apple-script"},
+            "scheduledFor": 1999999999000,
+            "schedule": {"type": "once"},
+        }
+
+    async def test_update_puts_typed_payload(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.put(f"{API}/message/schedule/7").mock(return_value=ok_json({}))
+        await client.update_scheduled_message(7, "g1", "bye", 1999999999000)
+        body = json.loads(route.calls[0].request.content)
+        assert body["type"] == "send-message"
+        assert body["payload"]["message"] == "bye"
+        assert body["schedule"] == {"type": "once"}
+
+    async def test_get_by_id(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.get(f"{API}/message/schedule/7").mock(return_value=ok_json({"id": 7}))
+        assert await client.get_scheduled_message(7) == {"id": 7}
+
+
+class TestCreateChat:
+    async def test_multiple_addresses(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/chat/new").mock(return_value=ok_json({}))
+        await client.create_chat(["+15551112222", "a@b.com"], message="hey")
+        body = json.loads(route.calls[0].request.content)
+        assert body["addresses"] == ["+15551112222", "a@b.com"]
+        assert body["message"] == "hey"
+
+    async def test_message_omitted_when_blank(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/chat/new").mock(return_value=ok_json({}))
+        await client.create_chat(["+15551112222"])
+        assert "message" not in json.loads(route.calls[0].request.content)
+
+
+class TestFindMy:
+    async def test_devices_get(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.get(f"{API}/icloud/findmy/devices").mock(return_value=ok_json([]))
+        await client.find_my_devices()
+        assert route.called
+
+    async def test_devices_refresh_posts(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/icloud/findmy/devices/refresh").mock(
+            return_value=ok_json([])
+        )
+        await client.find_my_devices(refresh=True)
+        assert route.called
+
+    async def test_friends_get(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.get(f"{API}/icloud/findmy/friends").mock(return_value=ok_json([]))
+        await client.find_my_friends()
+        assert route.called
+
+
+class TestMultipart:
+    async def test_upload_returns_path(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.post(f"{API}/attachment/upload").mock(
+            return_value=ok_json({"path": "uuid123/photo.jpg"})
+        )
+        out = await client.upload_attachment(b"bytes", "photo.jpg", "image/jpeg")
+        assert out == {"path": "uuid123/photo.jpg"}
+
+    async def test_send_multipart_body(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/message/multipart").mock(return_value=ok_json({}))
+        parts = [{"partIndex": 0, "text": "hi"}]
+        await client.send_multipart("g1", parts)
+        body = json.loads(route.calls[0].request.content)
+        assert body["chatGuid"] == "g1"
+        assert body["parts"] == parts
+        assert "method" not in body  # multipart is Private-API only
+
+
+class TestHandlesAndMisc:
+    async def test_query_handles_body(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.post(f"{API}/handle/query").mock(return_value=ok_json([]))
+        await client.query_handles(address="+1555", limit=10)
+        body = json.loads(route.calls[0].request.content)
+        assert body == {"limit": 10, "offset": 0, "address": "+1555"}
+
+    async def test_get_focus_status(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.get(f"{API}/handle/+15551234567/focus").mock(
+            return_value=ok_json({"focused": True})
+        )
+        assert await client.get_focus_status("+15551234567") == {"focused": True}
+
+    async def test_delete_chat_message(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.delete(f"{API}/chat/g1/m1").mock(return_value=ok_json(None))
+        await client.delete_chat_message("g1", "m1")
+        assert route.called
+
+    async def test_get_group_icon_returns_bytes(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        mock_api.get(f"{API}/chat/g1/icon").mock(
+            return_value=httpx.Response(200, content=b"\x89PNG")
+        )
+        assert await client.get_group_icon("g1") == b"\x89PNG"
+
+    async def test_remove_group_icon(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.delete(f"{API}/chat/g1/icon").mock(return_value=ok_json(None))
+        await client.remove_group_icon("g1")
+        assert route.called

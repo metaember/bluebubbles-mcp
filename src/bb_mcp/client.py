@@ -85,6 +85,18 @@ class BlueBubblesClient:
     async def server_info(self) -> Any:
         return await self._get("/server/info")
 
+    # -- find my --------------------------------------------------------------
+
+    async def find_my_devices(self, refresh: bool = False) -> Any:
+        if refresh:
+            return await self._post("/icloud/findmy/devices/refresh")
+        return await self._get("/icloud/findmy/devices")
+
+    async def find_my_friends(self, refresh: bool = False) -> Any:
+        if refresh:
+            return await self._post("/icloud/findmy/friends/refresh")
+        return await self._get("/icloud/findmy/friends")
+
     # -- chats ----------------------------------------------------------------
 
     async def list_chats(
@@ -157,6 +169,33 @@ class BlueBubblesClient:
     async def leave_chat(self, chat_guid: str) -> Any:
         return await self._post(f"/chat/{chat_guid}/leave")
 
+    async def delete_chat_message(self, chat_guid: str, message_guid: str) -> Any:
+        return await self._delete(f"/chat/{chat_guid}/{message_guid}")
+
+    async def get_group_icon(self, chat_guid: str) -> bytes:
+        resp = await self._http.get(
+            self._url(f"/chat/{chat_guid}/icon"), params=self._auth_params()
+        )
+        resp.raise_for_status()
+        return resp.content
+
+    async def set_group_icon(
+        self, chat_guid: str, file_data: bytes, filename: str, mime_type: str
+    ) -> Any:
+        resp = await self._http.post(
+            self._url(f"/chat/{chat_guid}/icon"),
+            params=self._auth_params(),
+            files={"icon": (filename, file_data, mime_type)},
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("status") and body["status"] >= 400:
+            raise BlueBubblesError(body.get("message", "Unknown error"), body)
+        return body.get("data")
+
+    async def remove_group_icon(self, chat_guid: str) -> Any:
+        return await self._delete(f"/chat/{chat_guid}/icon")
+
     # -- messages -------------------------------------------------------------
 
     async def send_message(
@@ -194,6 +233,55 @@ class BlueBubblesClient:
             "tempGuid": f"temp-{uuid.uuid4().hex}",
         }
         return await self._post("/chat/new", json=body)
+
+    async def create_chat(
+        self,
+        addresses: list[str],
+        message: str | None = None,
+        service: str = "iMessage",
+        method: str = "private-api",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "addresses": addresses,
+            "method": method,
+            "service": service,
+            "tempGuid": f"temp-{uuid.uuid4().hex}",
+        }
+        if message:
+            body["message"] = message
+        return await self._post("/chat/new", json=body)
+
+    async def send_multipart(
+        self,
+        chat_guid: str,
+        parts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        # Private API only; `method` is not accepted. Attachment parts must
+        # reference a path returned by `upload_attachment` first.
+        body: dict[str, Any] = {
+            "chatGuid": chat_guid,
+            "tempGuid": f"temp-{uuid.uuid4().hex}",
+            "parts": parts,
+        }
+        return await self._post("/message/multipart", json=body)
+
+    async def upload_attachment(
+        self, file_data: bytes, filename: str, mime_type: str
+    ) -> dict[str, Any]:
+        """Upload an attachment for later use in a multipart message.
+
+        Returns ``{"path": "<uuid>/<filename>"}`` to reference in a part.
+        """
+        resp = await self._http.post(
+            self._url("/attachment/upload"),
+            params=self._auth_params(),
+            files={"attachment": (filename, file_data, mime_type)},
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("status") and body["status"] >= 400:
+            raise BlueBubblesError(body.get("message", "Unknown error"), body)
+        return body.get("data")
 
     async def send_reaction(
         self,
@@ -277,6 +365,23 @@ class BlueBubblesClient:
     async def check_facetime_availability(self, address: str) -> Any:
         return await self._get("/handle/availability/facetime", params={"address": address})
 
+    async def query_handles(
+        self,
+        address: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        body: dict[str, Any] = {"limit": limit, "offset": offset}
+        if address:
+            body["address"] = address
+        return await self._post("/handle/query", json=body)
+
+    async def get_handle(self, handle_guid: str) -> dict[str, Any]:
+        return await self._get(f"/handle/{handle_guid}")
+
+    async def get_focus_status(self, handle_guid: str) -> Any:
+        return await self._get(f"/handle/{handle_guid}/focus")
+
     # -- attachments ----------------------------------------------------------
 
     async def get_attachment(self, attachment_guid: str) -> dict[str, Any]:
@@ -320,19 +425,46 @@ class BlueBubblesClient:
     async def list_scheduled_messages(self) -> list[dict[str, Any]]:
         return await self._get("/message/schedule")
 
+    @staticmethod
+    def _scheduled_body(
+        chat_guid: str, message: str, scheduled_for: int, method: str
+    ) -> dict[str, Any]:
+        # The server expects a typed action with a payload + schedule, not a
+        # flat message. `schedule.type=once` fires a single time at scheduledFor.
+        return {
+            "type": "send-message",
+            "payload": {"chatGuid": chat_guid, "message": message, "method": method},
+            "scheduledFor": scheduled_for,
+            "schedule": {"type": "once"},
+        }
+
     async def create_scheduled_message(
         self,
         chat_guid: str,
         message: str,
         scheduled_for: int,
+        method: str = "private-api",
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "chatGuid": chat_guid,
-            "message": message,
-            "scheduledFor": scheduled_for,
-            "tempGuid": f"temp-{uuid.uuid4().hex}",
-        }
-        return await self._post("/message/schedule", json=body)
+        return await self._post(
+            "/message/schedule",
+            json=self._scheduled_body(chat_guid, message, scheduled_for, method),
+        )
+
+    async def get_scheduled_message(self, schedule_id: int) -> dict[str, Any]:
+        return await self._get(f"/message/schedule/{schedule_id}")
+
+    async def update_scheduled_message(
+        self,
+        schedule_id: int,
+        chat_guid: str,
+        message: str,
+        scheduled_for: int,
+        method: str = "private-api",
+    ) -> dict[str, Any]:
+        return await self._put(
+            f"/message/schedule/{schedule_id}",
+            json=self._scheduled_body(chat_guid, message, scheduled_for, method),
+        )
 
     async def delete_scheduled_message(self, schedule_id: int) -> Any:
         return await self._delete(f"/message/schedule/{schedule_id}")
