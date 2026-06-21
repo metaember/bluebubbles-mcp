@@ -24,7 +24,7 @@ from typing import Any
 # fallback. When the Private API is unavailable these are removed from the
 # advertised toolset, so a client never sees a tool that can only 500.
 #
-# Plain sends (`send_message`, `send_message_to_address`, `send_attachment`) are
+# Plain sends (`send_message`, `create_chat`, `send_attachment`) are
 # deliberately absent: they degrade to the AppleScript `method` instead of being
 # removed. See `bb_mcp.server`.
 PRIVATE_API_TOOLS: tuple[str, ...] = (
