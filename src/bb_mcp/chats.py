@@ -25,8 +25,11 @@ See ``docs/canonical-chat-identity.md``.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Callable
+
+from bb_mcp.policy import address_from_guid
 
 # Lower rank wins when two rows for one participant are equally recent. iMessage
 # family first; the iMessageLite shadow is demoted below real iMessage; SMS/RCS last.
@@ -48,17 +51,17 @@ def canonical_chat_key(guid: str, normalize: Callable[[str], str]) -> str:
     - group (``<service>;+;<id>``) → ``"group:<id>"`` (service-stripped).
     - anything else → ``"raw:<guid>"`` (fail-safe: unique, never merges).
     """
+    address = address_from_guid(guid)  # not None only for a 1:1 GUID
+    if address is not None:
+        return f"1:1:{normalize(address)}"
     parts = _split(guid)
-    if len(parts) == 3 and parts[1] == "-":
-        return f"1:1:{normalize(parts[2])}"
     if len(parts) == 3 and parts[1] == "+":
         return f"group:{parts[2]}"
     return f"raw:{guid}"
 
 
 def _service_rank(guid: str) -> int:
-    parts = _split(guid)
-    return _SERVICE_RANK.get(parts[0].lower(), _DEFAULT_RANK) if parts else _DEFAULT_RANK
+    return _SERVICE_RANK.get(_split(guid)[0].lower(), _DEFAULT_RANK)
 
 
 def _last_message_ts(chat: dict[str, Any]) -> int:
@@ -67,8 +70,7 @@ def _last_message_ts(chat: dict[str, Any]) -> int:
 
 
 def _is_one_to_one(guid: str) -> bool:
-    parts = _split(guid)
-    return len(parts) == 3 and parts[1] == "-"
+    return address_from_guid(guid) is not None
 
 
 def dedupe_chats(
@@ -79,7 +81,7 @@ def dedupe_chats(
     (which is recency order when the source is sorted by ``lastmessage``)."""
     best: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    for chat in chats:
+    for chat in chats or []:
         guid = chat.get("guid") or ""
         key = canonical_chat_key(guid, normalize)
         if key not in best:
@@ -118,13 +120,24 @@ class ChatResolver:
         self._guid_to_canonical: dict[str, str] = {}
         self._addr_to_canonical: dict[str, str] = {}
         self._built_at: float | None = None
+        self._lock = asyncio.Lock()
+
+    def _is_cache_fresh(self) -> bool:
+        return self._built_at is not None and self._clock() - self._built_at <= self._ttl
 
     async def _ensure_fresh(self) -> None:
-        if self._built_at is not None and self._clock() - self._built_at <= self._ttl:
+        if self._is_cache_fresh():
             return
-        chats = await self._client.list_chats(
-            limit=1000, sort="lastmessage", with_fields=["participants", "lastmessage"]
-        )
+        async with self._lock:
+            if self._is_cache_fresh():  # built by another coroutine while we waited
+                return
+            # `list_chats` can return None on an empty/edge response; never iterate None.
+            chats = await self._client.list_chats(
+                limit=1000, sort="lastmessage", with_fields=["participants", "lastmessage"]
+            ) or []
+            self._rebuild(chats)
+
+    def _rebuild(self, chats: list[dict[str, Any]]) -> None:
         by_addr: dict[str, list[dict[str, Any]]] = {}
         for chat in chats:
             guid = chat.get("guid") or ""
@@ -158,7 +171,8 @@ class ChatResolver:
         if len(participants) == 1:
             return self._normalize(participants[0])
         # Fall back to the address embedded in a 1:1 GUID's final segment.
-        return self._normalize(_split(guid)[2]) if _is_one_to_one(guid) else None
+        address = address_from_guid(guid)
+        return self._normalize(address) if address else None
 
     async def canonical_guid(self, guid: str) -> str:
         """The live canonical GUID for ``guid``'s conversation.
