@@ -229,6 +229,9 @@ async def _canonical_guid(ctx: Context, chat_guid: str) -> str:
     try:
         return await resolver.canonical_guid(chat_guid)
     except BlueBubblesError:
+        # Degrade to the input GUID rather than fail the read/send — but log it,
+        # since this can route to a stale alias row (the bug resolution prevents).
+        logger.warning("Chat resolution failed for %s; using it unresolved", chat_guid)
         return chat_guid
 
 

@@ -90,6 +90,14 @@ Wired into `server.py`:
 - **Resolution is best-effort & TTL-cached (~60s).** A brand-new alias appearing
   mid-window resolves to itself until the cache refreshes — worst case a re-read, never a
   bypass.
+- **The enumeration caps at the 1000 most-recently-active chats.** A conversation whose
+  rows all fall outside that window won't be in the alias map and resolves to itself
+  (soft-fail to old behavior for the long tail; never a bypass).
+- **The live freshness check is scoped to the canonical row.** Within the merged
+  conversation, a barge-in that lands on a *non-canonical* alias (e.g. the person texts
+  via SMS while the canonical thread is iMessage) is invisible until the canonical flips
+  to that row on the next resolution refresh (≤ TTL). Bounded under-protection on a
+  cooperative guardrail; a deeper fix would union the live check across the person's rows.
 - **Group aliasing** across services (rare) isn't resolved; groups key on their opaque id.
 - **SMS vs iMessage to one number share a watermark** by design. If someone genuinely has
   independent active SMS *and* iMessage threads with unseen messages in one, a read of the

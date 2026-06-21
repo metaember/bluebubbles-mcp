@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from bb_mcp.chats import ChatResolver, canonical_chat_key
+from bb_mcp.chats import ChatResolver, canonical_chat_key, dedupe_chats
 
 NORM = lambda a: a.strip().lower()  # noqa: E731 - simple passthrough normalizer
 
@@ -130,3 +130,26 @@ class TestChatResolver:
         clock.advance(61)
         await r.canonical_guid("iMessage;-;+15550005")
         assert client.list_calls == 2
+
+    async def test_none_enumeration_is_fail_safe(self) -> None:
+        # list_chats can return None on an edge response; resolve to self, don't crash.
+        client = FakeClient(None)  # type: ignore[arg-type]
+        r = ChatResolver(client, NORM, clock=FakeClock())
+        assert await r.canonical_guid("iMessage;-;+15550006") == "iMessage;-;+15550006"
+        assert await r.find_for_address("+15550006") is None
+
+
+class TestDedupeChats:
+    def test_collapses_alias_rows_keeping_most_recent(self) -> None:
+        rows = [
+            chat("iMessage;-;+15550007", "+15550007", 900),
+            chat("iMessageLite;-;+15550007", "+15550007", 100),  # stale shadow
+            chat("iMessage;-;+15550008", "+15550008", 800),  # different person
+        ]
+        out = dedupe_chats(rows, NORM)
+        guids = {c["guid"] for c in out}
+        assert guids == {"iMessage;-;+15550007", "iMessage;-;+15550008"}
+
+    def test_none_and_empty(self) -> None:
+        assert dedupe_chats(None, NORM) == []  # type: ignore[arg-type]
+        assert dedupe_chats([], NORM) == []
