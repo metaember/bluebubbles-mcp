@@ -293,6 +293,27 @@ async def _check_freshness(ctx: Context, chat_guid: str) -> None:
         )
 
 
+async def _existing_chat_guid_for_address(
+    ctx: Context, address: str, service: str
+) -> str | None:
+    """The 1:1 chat GUID for ``address`` if a conversation already exists, else None.
+
+    Best-effort: constructs the 1:1 GUID (``{service};-;{normalized_address}``) and
+    checks whether it has any history. Used by ``create_chat`` to refuse reaching an
+    existing chat by address — replying into an existing chat is ``send_message``'s
+    job (which the freshness guard covers). An address that normalizes differently
+    from BlueBubbles' stored handle won't resolve and is treated as new (documented
+    residual edge).
+    """
+    svc = "SMS" if service.upper() == "SMS" else "iMessage"
+    guid = f"{svc};-;{_contacts(ctx).normalize(address)}"
+    try:
+        live = await _latest_message_ts(ctx, guid)
+    except BlueBubblesError:
+        return None  # no such chat
+    return guid if live is not None else None
+
+
 async def _enrich(ctx: Context, data: Any) -> Any:
     """Annotate handle addresses in a response with their contact names.
 
@@ -517,7 +538,6 @@ async def get_unread_chats(
     results = []
     for chat in unread:
         messages = await bb.get_chat_messages(chat["guid"], limit=message_limit)
-        _record_watermark(ctx, chat["guid"], messages)
         results.append({
             "chat": chat,
             "recent_messages": messages,
@@ -602,7 +622,12 @@ async def send_message(
     message: str,
     reply_to_guid: str | None = None,
 ) -> str:
-    """Send a text message to an existing chat.
+    """Reply into an existing chat you have the GUID for (1:1 or group).
+
+    Use this when you already know the chat — e.g. from list_chats, find_chats, or
+    after reading it with get_chat_messages. It's the only way to reach a group, and
+    the only one that supports threaded replies. To start a new conversation with
+    someone by phone/email when no chat exists yet, use create_chat instead.
 
     Args:
         chat_guid: The chat GUID to send to.
@@ -624,17 +649,23 @@ async def send_message(
 
 
 @mcp.tool(annotations=SEND)
-async def send_message_to_address(
+async def create_chat(
     ctx: Context,
     address: str,
     message: str,
     service: str = "iMessage",
 ) -> str:
-    """Send a message to a phone number or email, creating a new chat if needed.
+    """Start a NEW 1:1 conversation with someone by phone number or email.
+
+    For first contact, when no chat with this person exists yet. To send into a
+    conversation that already exists, use send_message with its chat_guid — that's
+    the path that confirms you've seen the latest first. With the freshness guard on,
+    this refuses to reach an existing chat and points you to it. Cannot create a
+    group; use create_group_chat.
 
     Args:
         address: Phone number (e.g. '+15551234567') or email address.
-        message: The message text.
+        message: The opening message.
         service: 'iMessage' or 'SMS' (default iMessage).
     """
     if service.upper() == "SMS" and not _private_api(ctx):
@@ -643,6 +674,15 @@ async def send_message_to_address(
             "enabled on this server. Use service='iMessage'."
         )
     _guard(ctx).check_address(address)
+    if _freshness(ctx) is not None:
+        existing = await _existing_chat_guid_for_address(ctx, address, service)
+        if existing:
+            raise ValueError(
+                f"A conversation with this person already exists ({existing}). To "
+                f"reply in it, read it with get_chat_messages and send with "
+                f"send_message using that chat_guid. create_chat is only for "
+                f"starting a new conversation."
+            )
     data = await _bb(ctx).send_message_to_address(
         address, message, service=service, method=_send_method(ctx)
     )
@@ -858,9 +898,9 @@ async def lookup_contact(ctx: Context, addresses: list[str]) -> str:
 async def find_contact(ctx: Context, name: str) -> str:
     """Find contacts by name (case-insensitive substring match).
 
-    Use this when you know someone's name but not their number — then message
-    them with send_message_to_address, or pass the name to find_chats. Returns
-    each match's name, phone numbers, and emails.
+    Use this when you know someone's name but not their number — then start a new
+    conversation with create_chat, or pass the name to find_chats to reach an
+    existing one. Returns each match's name, phone numbers, and emails.
 
     Args:
         name: Full or partial contact name (e.g. 'mom', 'alice').

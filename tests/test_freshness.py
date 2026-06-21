@@ -12,12 +12,14 @@ from bb_mcp.freshness import (
     FreshnessTracker,
     newest_message_ts,
 )
+from bb_mcp.client import BlueBubblesError
 from bb_mcp.server import (
     _agent_id,
     _assert_freshness_transport_compatible,
     _build_freshness,
     _check_freshness,
     _record_watermark,
+    create_chat,
     mcp,
     send_message,
 )
@@ -145,12 +147,17 @@ class TestNewestMessageTs:
 
 
 class FakeBB:
-    def __init__(self, messages: list[dict], send_ts: int | None = None) -> None:
+    def __init__(
+        self, messages: list[dict], send_ts: int | None = None, raise_on_get: bool = False
+    ) -> None:
         self.messages = messages
         self.send_ts = send_ts
+        self.raise_on_get = raise_on_get
         self.sent: list[tuple] = []
 
     async def get_chat_messages(self, chat_guid: str, **kwargs) -> list[dict]:
+        if self.raise_on_get:
+            raise BlueBubblesError("chat not found", {})
         return self.messages
 
     async def send_message(self, chat_guid: str, message: str, **kwargs) -> dict:
@@ -159,10 +166,22 @@ class FakeBB:
         self.messages = self.messages + [sent]  # the send advances the conversation
         return sent
 
+    async def send_message_to_address(self, address: str, message: str, **kwargs) -> dict:
+        self.sent.append((address, message))
+        return {"guid": "new-1", "isFromMe": True, "dateCreated": self.send_ts}
+
 
 class FakeGuard:
     async def check_chat(self, chat_guid: str) -> None:
         return None
+
+    def check_address(self, address: str) -> None:
+        return None
+
+
+class FakeContacts:
+    def normalize(self, address: str) -> str:
+        return address
 
 
 def make_ctx(*, freshness=None, meta=None, bb=None, private_api=True,
@@ -174,6 +193,7 @@ def make_ctx(*, freshness=None, meta=None, bb=None, private_api=True,
             "freshness_identity": identity,
             "bb": bb,
             "guard": FakeGuard(),
+            "contacts": FakeContacts(),
             "private_api": private_api,
         },
         meta=meta_obj,
@@ -422,3 +442,40 @@ class TestSessionModeFlow:
         with pytest.raises(FreshnessError):
             await send_message(ctx, "chat-A", "hi")
         assert bb.sent == []
+
+
+class TestCreateChat:
+    """create_chat is for NEW conversations only: with the guard on it refuses to
+    reach an existing 1:1 chat (closing the address-path bypass) and points the agent
+    to send_message; first contact passes through."""
+
+    ADDR = "+15551234567"
+
+    async def test_existing_chat_is_refused(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([{"guid": "a", "isFromMe": False, "dateCreated": 100}])
+        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        with pytest.raises(ValueError, match="already exists"):
+            await create_chat(ctx, self.ADDR, "hi")
+        assert bb.sent == []
+
+    async def test_first_contact_no_history_is_allowed(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([])  # no existing conversation
+        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        await create_chat(ctx, self.ADDR, "hi")
+        assert bb.sent == [(self.ADDR, "hi")]
+
+    async def test_first_contact_no_chat_is_allowed(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([], raise_on_get=True)  # chat lookup 404s -> truly new
+        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        await create_chat(ctx, self.ADDR, "hi")
+        assert bb.sent == [(self.ADDR, "hi")]
+
+    async def test_disabled_guard_skips_existence_check(self) -> None:
+        # Guard off -> no bypass to prevent, so create_chat doesn't probe/refuse.
+        bb = FakeBB([{"guid": "a", "isFromMe": False, "dateCreated": 100}])
+        ctx = make_ctx(freshness=None, meta=None, bb=bb)
+        await create_chat(ctx, self.ADDR, "hi")
+        assert bb.sent == [(self.ADDR, "hi")]

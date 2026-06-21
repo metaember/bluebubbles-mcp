@@ -193,11 +193,15 @@ class FreshnessTracker:
 - **Record on read** — helper `_record_watermark(ctx, chat_guid, raw_messages)` computes
   the newest message `dateCreated` over *all* senders (`newest_message_ts`: `max(dateCreated
   for m in raw_messages if "isFromMe" in m)`, else None) and calls `tracker.record(...)`.
-  Called (when enabled) from:
-  - `get_chat_messages` — with its `data` and `chat_guid`.
-  - `get_unread_chats` — per chat, with each chat's fetched `messages` and `chat["guid"]`.
-  - **Not** `get_recent_messages` / `search_messages` — cross-chat firehoses, not a thread
-    read; recording from them would let an agent "see" a chat without reading it.
+  Called (when enabled) from **`get_chat_messages` only** — the one tool whose semantics
+  are "I'm opening *this* thread to act on it." Deliberately **not**:
+  - `get_unread_chats` — a scan across many chats with a shallow per-chat preview (5 msgs).
+    Its preview is newest-first so the watermark *would* be accurate for staleness, but
+    recording from a scan gives false confidence on *context* — an agent could reply off a
+    skim without seeing the history that changes the right reply. Forcing an explicit
+    `get_chat_messages` on the chat you actually want to reply to is the due-diligence
+    forcing function.
+  - `get_recent_messages` / `search_messages` — cross-chat firehoses, not a thread read.
 - **Record on send** — helper `_record_sent(ctx, chat_guid, sent)` advances the agent's
   watermark to its own just-sent message (from the send response's `dateCreated`; falls
   back to one re-fetch only if the response lacks it). Called after the send in
@@ -215,7 +219,10 @@ class FreshnessTracker:
                            "longer be warranted.")
   ```
   Called at the top of: **`send_message`, `send_multipart`, `send_attachment`** (after the
-  existing `_guard(ctx).check_chat(...)`).
+  existing `_guard(ctx).check_chat(...)`). The address-based **`create_chat`** doesn't gate —
+  instead, when the guard is on, it uses `_existing_chat_guid_for_address(...)` and **refuses**
+  if a 1:1 chat already exists, pointing the agent to `send_message` (so every send into an
+  existing chat flows through the gated path; the address tool can't bypass it).
   - `_latest_message_ts(ctx, chat_guid)` fetches recent messages
     (`get_chat_messages(chat_guid, limit=10, sort="DESC")`) and returns the max
     `dateCreated` over all senders, or None.
@@ -228,11 +235,12 @@ or require `_meta.agentId` (fail closed) in `meta` mode.
 | Tool | Behavior when guard enabled |
 |------|------------------------------|
 | `get_chat_messages` | record watermark; identify the agent |
-| `get_unread_chats` | record watermark (per chat); identify the agent |
+| `get_unread_chats` | **does not record** — a scan, not engagement (see "Record on read") |
 | `send_message` | gate; identify the agent |
 | `send_multipart` | gate; identify the agent |
 | `send_attachment` | gate; identify the agent |
-| `send_message_to_address`, `create_group_chat` | **exempt** — address-based, may be first contact / new chat (no thread to be stale about) |
+| `create_chat` | new conversations only — **refuses** (when guard on) if a 1:1 thread already exists, pointing to `send_message`. Closes the bypass where an agent reaches an existing chat by address instead of `chat_guid`, by removing the overlap entirely |
+| `create_group_chat` | **exempt** — always a new chat (no thread to be stale about) |
 | `send_reaction`, `edit_message` | **exempt v1** — lower-stakes; candidates for phase 2 |
 | all other tools | unaffected |
 
@@ -303,5 +311,11 @@ established messaging practice:
   re-plan (collision *detection*, like Help Scout). It does **not** prevent two agents that
   pass their checks *simultaneously* from both sending (a TOCTOU window between check and
   send). The complete fix is a shared per-chat lock (mutual exclusion) — still out of scope.
-- Gating `send_reaction` / `edit_message`.
-- Gating address-based sends after resolving them to an existing chat.
+- **`create_chat`'s existing-chat detection is best-effort.** It resolves the address to a
+  1:1 GUID by constructing `{service};-;{normalized_address}`. For normal phone/email this
+  matches BlueBubbles' stored GUID, but an exotic/region-ambiguous address that normalizes
+  differently could fail to resolve — treated as new, so `create_chat` would send into an
+  existing chat ungated (narrow residual bypass). A fully robust version would look the chat
+  up by participant via the API. (Also: the refusal is skipped when the guard is off, since
+  there's then no bypass to prevent.)
+- Gating `send_reaction` / `edit_message` (still exempt; `edit_message` lacks a `chat_guid`).

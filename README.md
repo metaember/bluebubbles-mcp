@@ -124,8 +124,9 @@ a while ago, a new message arrived in the gap, and it answers without seeing it.
 The freshness guard enforces, server-side and per agent, that a send into a chat
 only goes through if that agent **read the chat within the last hour and nothing
 new has arrived since**. (A consequence: you must read an existing chat before
-sending into it — good hygiene for replies. Sending to a brand-new recipient via
-`send_message_to_address` is unaffected.)
+sending into it — good hygiene for replies. Starting a brand-new conversation via
+`create_chat` is unaffected; it's for first contact only and, with the guard on,
+refuses to reach an existing chat — use `send_message` for those.)
 
 **On by default.** Disable with `BLUEBUBBLES_FRESHNESS=off`. Tuning:
 
@@ -199,8 +200,8 @@ correct in both 1:1 and group chats.
 | `set_group_icon` | Set a group chat's icon | idempotent |
 | `start_typing` | Show typing indicator | open-world |
 | `stop_typing` | Stop typing indicator | open-world |
-| `send_message` | Send to existing chat | open-world |
-| `send_message_to_address` | Send to phone/email | open-world |
+| `send_message` | Send to an existing chat (1:1 or group) | open-world |
+| `create_chat` | Start a new 1:1 conversation by phone/email | open-world |
 | `create_group_chat` | Create a group chat + first message | open-world |
 | `send_attachment` | Send a file attachment | open-world |
 | `send_multipart` | Send text + attachments as one message | open-world |
