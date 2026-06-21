@@ -117,6 +117,38 @@ Disable it (for leaner responses or if your contact DB is slow) with:
 
 `find_contact` / `find_chats` still work when this is off — they're explicit.
 
+### Freshness guard
+
+An agent can reply to a conversation against a stale snapshot — it read the thread
+a while ago, a new message arrived in the gap, and it answers without seeing it.
+The freshness guard enforces, server-side and per agent, that a send into a chat
+only goes through if that agent **read the chat within the last hour and nothing
+new has arrived since**. (A consequence: you must read an existing chat before
+sending into it — good hygiene for replies. Sending to a brand-new recipient via
+`send_message_to_address` is unaffected.)
+
+**On by default.** Disable with `BLUEBUBBLES_FRESHNESS=off`. Tuning:
+
+```jsonc
+"BLUEBUBBLES_FRESHNESS": "off",                  // default: on
+"BLUEBUBBLES_FRESHNESS_IDENTITY": "session",     // how agents are told apart (default)
+"BLUEBUBBLES_WATERMARK_TTL_SECONDS": "3600",     // how long a read stays "fresh" (default 1h)
+"BLUEBUBBLES_WATERMARK_MAX_AGENTS": "10000"      // memory backstop (default 10000)
+```
+
+The freshness check is *per agent*, so it needs to tell agents apart.
+`BLUEBUBBLES_FRESHNESS_IDENTITY` selects how:
+
+- **`session`** (default): use the MCP transport session — automatic and
+  zero-config for **stdio** (one agent) and **direct HTTP** (one session per
+  connecting client). Over HTTP this relies on stateful sessions (FastMCP's
+  default); the server **refuses to start** if you combine session-identity
+  freshness with stateless HTTP, since every send would be blocked.
+- **`meta`**: identify agents by a per-agent `agentId` the caller stamps into
+  request `_meta`. Required only behind a **pooling proxy/airlock**, where every
+  agent shares one transport session so `session` can't distinguish them. See
+  [`docs/freshness-guard.md`](docs/freshness-guard.md) for the airlock contract.
+
 ### Compact responses & sender filtering
 
 Message reads return a **compact projection by default** — the fields an

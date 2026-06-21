@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Mapping
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -27,6 +27,13 @@ from bb_mcp.contacts import (
     contact_addresses,
     contact_display_name,
     inject_names,
+)
+from bb_mcp.freshness import (
+    DEFAULT_MAX_AGENTS,
+    DEFAULT_TTL_SECONDS,
+    FreshnessError,
+    FreshnessTracker,
+    newest_message_ts,
 )
 from bb_mcp.policy import DEFAULT_REGION, Allowlist, Guard
 from bb_mcp.projection import filter_by_sender, project
@@ -102,6 +109,7 @@ async def lifespan(server: FastMCP):
     region = os.environ.get("BLUEBUBBLES_ALLOWLIST_REGION", DEFAULT_REGION)
     contacts = ContactResolver(client, region=region)
     resolve_names = parse_override(os.environ.get("BLUEBUBBLES_RESOLVE_NAMES")) is not False
+    freshness, freshness_identity = _build_freshness(os.environ)
 
     info = await _server_info(client)
     forced = parse_override(os.environ.get("BLUEBUBBLES_PRIVATE_API"))
@@ -128,9 +136,48 @@ async def lifespan(server: FastMCP):
             "my_address": my_address,
             "contacts": contacts,
             "resolve_names": resolve_names,
+            "freshness": freshness,
+            "freshness_identity": freshness_identity,
         }
     finally:
         await client.close()
+
+
+def _build_freshness(env: Mapping[str, str]) -> tuple[FreshnessTracker | None, str]:
+    """Build the per-agent freshness guard and its identity mode.
+
+    Returns ``(tracker, identity)``; ``tracker`` is ``None`` when disabled.
+
+    **On by default** — the guard makes an agent read a chat before it can reply
+    into it, which is good hygiene for any deployment, not just a multi-agent one.
+    Disable with ``BLUEBUBBLES_FRESHNESS=off``.
+
+    Identity (``BLUEBUBBLES_FRESHNESS_IDENTITY``) decides how agents are told
+    apart — the only knob that depends on deployment topology:
+
+    - ``session`` (default): the MCP transport session. Works with no extra setup
+      for stdio (one agent) and direct HTTP (one session per connecting client).
+      Requires stateful HTTP over HTTP (FastMCP's default).
+    - ``meta``: a per-agent ``agentId`` the caller stamps into request ``_meta``.
+      Required behind a pooling proxy/airlock, where every agent shares one
+      transport session so ``session`` can't tell them apart. See
+      ``docs/freshness-guard.md``.
+    """
+    if parse_override(env.get("BLUEBUBBLES_FRESHNESS")) is False:
+        return None, "off"
+    identity = env.get("BLUEBUBBLES_FRESHNESS_IDENTITY", "session").strip().lower()
+    if identity not in ("session", "meta"):
+        identity = "session"
+    ttl = float(env.get("BLUEBUBBLES_WATERMARK_TTL_SECONDS", DEFAULT_TTL_SECONDS))
+    max_agents = int(env.get("BLUEBUBBLES_WATERMARK_MAX_AGENTS", DEFAULT_MAX_AGENTS))
+    logger.info(
+        "Freshness guard enabled (identity=%s, ttl=%ss, max_agents=%s); sends "
+        "require a fresh read of the chat.",
+        identity,
+        ttl,
+        max_agents,
+    )
+    return FreshnessTracker(ttl_seconds=ttl, max_agents=max_agents), identity
 
 
 mcp = FastMCP(
@@ -163,6 +210,87 @@ def _send_method(ctx: Context) -> str:
 
 def _contacts(ctx: Context) -> ContactResolver:
     return ctx.request_context.lifespan_context["contacts"]
+
+
+def _freshness(ctx: Context) -> FreshnessTracker | None:
+    return ctx.request_context.lifespan_context.get("freshness")
+
+
+def _freshness_identity(ctx: Context) -> str:
+    return ctx.request_context.lifespan_context.get("freshness_identity", "session")
+
+
+def _agent_id(ctx: Context) -> str:
+    """A stable key identifying the calling agent, per the configured identity mode.
+
+    - ``session``: derived from the MCP transport session, which is per-connection
+      (per-agent) for stdio and direct HTTP. No caller cooperation needed.
+    - ``meta``: the ``agentId`` the caller (a pooling airlock) stamped into request
+      ``_meta``. Fail closed — a missing or blank id is rejected rather than
+      silently shared across agents.
+
+    Only called when the guard is enabled.
+    """
+    if _freshness_identity(ctx) == "meta":
+        meta = ctx.request_context.meta
+        agent_id = getattr(meta, "agentId", None) if meta is not None else None
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise FreshnessError(
+                "This server is configured to identify agents by _meta.agentId, "
+                "but none was supplied on this request."
+            )
+        return f"meta:{agent_id}"
+    return f"session:{id(ctx.request_context.session)}"
+
+
+def _record_watermark(ctx: Context, chat_guid: str, raw_messages: Any) -> None:
+    """Record what this agent just saw for ``chat_guid`` (no-op if guard disabled).
+
+    Operates on the raw BlueBubbles message list (before projection), so the
+    newest-message timestamp reflects exactly what was fetched.
+    """
+    tracker = _freshness(ctx)
+    if tracker is None:
+        return
+    tracker.record(_agent_id(ctx), chat_guid, newest_message_ts(raw_messages))
+
+
+async def _record_sent(ctx: Context, chat_guid: str, sent: Any) -> None:
+    """Advance this agent's watermark to its own just-sent message (no-op if the
+    guard is disabled), so sending doesn't make the agent's *next* send look stale.
+
+    Uses the send response's timestamp; only if it lacks one does it fall back to a
+    re-fetch (rare).
+    """
+    tracker = _freshness(ctx)
+    if tracker is None:
+        return
+    ts = sent.get("dateCreated") if isinstance(sent, dict) else None
+    if ts is None:
+        ts = await _latest_message_ts(ctx, chat_guid)
+    tracker.record(_agent_id(ctx), chat_guid, ts)
+
+
+async def _latest_message_ts(ctx: Context, chat_guid: str) -> int | None:
+    """Fetch the chat's newest message timestamp right now (one API round-trip)."""
+    recent = await _bb(ctx).get_chat_messages(chat_guid, limit=10, sort="DESC")
+    return newest_message_ts(recent)
+
+
+async def _check_freshness(ctx: Context, chat_guid: str) -> None:
+    """Block a send unless this agent recently read ``chat_guid`` and nothing new
+    has arrived since — from any sender (no-op if the guard is disabled)."""
+    tracker = _freshness(ctx)
+    if tracker is None:
+        return
+    expected = tracker.last_seen(_agent_id(ctx), chat_guid)
+    live = await _latest_message_ts(ctx, chat_guid)
+    if live is not None and (expected is None or live > expected):
+        raise FreshnessError(
+            "The conversation moved since you last read it — new messages have "
+            "arrived. Call get_chat_messages to see them, then re-plan in light of "
+            "them: your reply may need revising, or may no longer be warranted."
+        )
 
 
 async def _enrich(ctx: Context, data: Any) -> Any:
@@ -341,6 +469,7 @@ async def get_chat_messages(
         after=after,
         before=before,
     )
+    _record_watermark(ctx, chat_guid, data)
     return await _present_messages(
         ctx, data, extended=extended, from_address=from_address, limit=limit
     )
@@ -388,6 +517,7 @@ async def get_unread_chats(
     results = []
     for chat in unread:
         messages = await bb.get_chat_messages(chat["guid"], limit=message_limit)
+        _record_watermark(ctx, chat["guid"], messages)
         results.append({
             "chat": chat,
             "recent_messages": messages,
@@ -485,9 +615,11 @@ async def send_message(
             "enabled on this server. Send without reply_to_guid."
         )
     await _guard(ctx).check_chat(chat_guid)
+    await _check_freshness(ctx, chat_guid)
     data = await _bb(ctx).send_message(
         chat_guid, message, method=_send_method(ctx), reply_to_guid=reply_to_guid
     )
+    await _record_sent(ctx, chat_guid, data)
     return _fmt(data)
 
 
@@ -564,6 +696,7 @@ async def send_multipart(
         parts: Ordered list of text and/or attachment parts (see above).
     """
     await _guard(ctx).check_chat(chat_guid)
+    await _check_freshness(ctx, chat_guid)
     assembled: list[dict[str, Any]] = []
     for index, part in enumerate(parts):
         if part.get("text"):
@@ -580,6 +713,7 @@ async def send_multipart(
         else:
             raise ValueError(f"Part {index} must have either 'text' or 'data_base64'.")
     data = await _bb(ctx).send_multipart(chat_guid, assembled)
+    await _record_sent(ctx, chat_guid, data)
     return _fmt(data)
 
 
@@ -1081,10 +1215,12 @@ async def send_attachment(
         mime_type: MIME type (e.g. 'image/jpeg'). Defaults to 'application/octet-stream'.
     """
     await _guard(ctx).check_chat(chat_guid)
+    await _check_freshness(ctx, chat_guid)
     file_data = base64.b64decode(data_base64)
     data = await _bb(ctx).send_attachment(
         chat_guid, file_data, filename, mime_type, method=_send_method(ctx)
     )
+    await _record_sent(ctx, chat_guid, data)
     return _fmt(data)
 
 
@@ -1119,6 +1255,32 @@ async def find_my_friends(ctx: Context, refresh: bool = False) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _assert_freshness_transport_compatible(transport: str, env: Mapping[str, str]) -> None:
+    """Refuse to start in a config where the freshness guard can't work.
+
+    In ``session`` identity mode over HTTP, the guard keys each agent's watermark
+    on the MCP transport session, which must persist across that agent's
+    read→send. Stateless HTTP gives every request a fresh session, so a send would
+    always see "no prior read" and be blocked — the guard would silently reject
+    every send. Fail fast with a clear fix instead.
+
+    ``meta`` mode is unaffected (identity comes from ``_meta.agentId``, not the
+    session), and stdio sessions are always persistent — so this only fires for
+    streamable-http + stateless + session-identity + guard-on.
+    """
+    if transport != "streamable-http" or not mcp.settings.stateless_http:
+        return
+    tracker, identity = _build_freshness(env)
+    if tracker is not None and identity == "session":
+        raise RuntimeError(
+            "Incompatible config: the freshness guard in session-identity mode "
+            "needs persistent MCP sessions, but stateless HTTP is enabled — every "
+            "send would be blocked. Fix one of: disable stateless HTTP; set "
+            "BLUEBUBBLES_FRESHNESS_IDENTITY=meta (behind a proxy that stamps "
+            "_meta.agentId); or set BLUEBUBBLES_FRESHNESS=off."
+        )
+
+
 def main() -> None:
     """Run the server.
 
@@ -1127,6 +1289,7 @@ def main() -> None:
     for running as a container that an HTTP-capable MCP client connects to.
     """
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    _assert_freshness_transport_compatible(transport, os.environ)
     mcp.run(transport=transport)
 
 
