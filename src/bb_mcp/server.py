@@ -21,6 +21,7 @@ from bb_mcp.capabilities import (
     private_api_from_info,
 )
 from bb_mcp.client import BlueBubblesClient, BlueBubblesError
+from bb_mcp.chats import ChatResolver, canonical_chat_key, dedupe_chats
 from bb_mcp.contacts import (
     ContactResolver,
     collect_addresses,
@@ -108,6 +109,7 @@ async def lifespan(server: FastMCP):
     guard = Guard(allowlist, client)
     region = os.environ.get("BLUEBUBBLES_ALLOWLIST_REGION", DEFAULT_REGION)
     contacts = ContactResolver(client, region=region)
+    chat_resolver = ChatResolver(client, contacts.normalize)
     resolve_names = parse_override(os.environ.get("BLUEBUBBLES_RESOLVE_NAMES")) is not False
     freshness, freshness_identity = _build_freshness(os.environ)
 
@@ -135,6 +137,7 @@ async def lifespan(server: FastMCP):
             "private_api": private_api,
             "my_address": my_address,
             "contacts": contacts,
+            "chat_resolver": chat_resolver,
             "resolve_names": resolve_names,
             "freshness": freshness,
             "freshness_identity": freshness_identity,
@@ -212,6 +215,32 @@ def _contacts(ctx: Context) -> ContactResolver:
     return ctx.request_context.lifespan_context["contacts"]
 
 
+def _resolver(ctx: Context) -> ChatResolver | None:
+    return ctx.request_context.lifespan_context.get("chat_resolver")
+
+
+async def _canonical_guid(ctx: Context, chat_guid: str) -> str:
+    """Resolve an alias GUID (iMessageLite/any/SMS/...) to the live canonical chat,
+    so reads and sends land on the real thread, not a stale shadow row. Falls back to
+    the input GUID if no resolver is configured or nothing resolves (fail-safe)."""
+    resolver = _resolver(ctx)
+    if resolver is None:
+        return chat_guid
+    try:
+        return await resolver.canonical_guid(chat_guid)
+    except BlueBubblesError:
+        # Degrade to the input GUID rather than fail the read/send — but log it,
+        # since this can route to a stale alias row (the bug resolution prevents).
+        logger.warning("Chat resolution failed for %s; using it unresolved", chat_guid)
+        return chat_guid
+
+
+def _watermark_key(ctx: Context, chat_guid: str) -> str:
+    """The service-agnostic canonical key the freshness watermark is stored under, so
+    a read under any alias counts for a send under any alias to the same person."""
+    return canonical_chat_key(chat_guid, _contacts(ctx).normalize)
+
+
 def _freshness(ctx: Context) -> FreshnessTracker | None:
     return ctx.request_context.lifespan_context.get("freshness")
 
@@ -252,7 +281,9 @@ def _record_watermark(ctx: Context, chat_guid: str, raw_messages: Any) -> None:
     tracker = _freshness(ctx)
     if tracker is None:
         return
-    tracker.record(_agent_id(ctx), chat_guid, newest_message_ts(raw_messages))
+    tracker.record(
+        _agent_id(ctx), _watermark_key(ctx, chat_guid), newest_message_ts(raw_messages)
+    )
 
 
 async def _record_sent(ctx: Context, chat_guid: str, sent: Any) -> None:
@@ -268,7 +299,7 @@ async def _record_sent(ctx: Context, chat_guid: str, sent: Any) -> None:
     ts = sent.get("dateCreated") if isinstance(sent, dict) else None
     if ts is None:
         ts = await _latest_message_ts(ctx, chat_guid)
-    tracker.record(_agent_id(ctx), chat_guid, ts)
+    tracker.record(_agent_id(ctx), _watermark_key(ctx, chat_guid), ts)
 
 
 async def _latest_message_ts(ctx: Context, chat_guid: str) -> int | None:
@@ -283,7 +314,7 @@ async def _check_freshness(ctx: Context, chat_guid: str) -> None:
     tracker = _freshness(ctx)
     if tracker is None:
         return
-    expected = tracker.last_seen(_agent_id(ctx), chat_guid)
+    expected = tracker.last_seen(_agent_id(ctx), _watermark_key(ctx, chat_guid))
     live = await _latest_message_ts(ctx, chat_guid)
     if live is not None and (expected is None or live > expected):
         raise FreshnessError(
@@ -293,25 +324,22 @@ async def _check_freshness(ctx: Context, chat_guid: str) -> None:
         )
 
 
-async def _existing_chat_guid_for_address(
-    ctx: Context, address: str, service: str
-) -> str | None:
-    """The 1:1 chat GUID for ``address`` if a conversation already exists, else None.
+async def _existing_chat_guid_for_address(ctx: Context, address: str) -> str | None:
+    """The canonical GUID of an existing 1:1 conversation with ``address``, else None.
 
-    Best-effort: constructs the 1:1 GUID (``{service};-;{normalized_address}``) and
-    checks whether it has any history. Used by ``create_chat`` to refuse reaching an
-    existing chat by address — replying into an existing chat is ``send_message``'s
-    job (which the freshness guard covers). An address that normalizes differently
-    from BlueBubbles' stored handle won't resolve and is treated as new (documented
-    residual edge).
+    Used by ``create_chat`` to refuse reaching an existing chat by address — replying
+    into an existing chat is ``send_message``'s job (which the freshness guard covers).
+    Resolves via :class:`ChatResolver` (enumerate + participant match), so it catches a
+    chat under *any* service alias (iMessage/SMS/iMessageLite/any), not just a
+    constructed ``iMessage`` GUID.
     """
-    svc = "SMS" if service.upper() == "SMS" else "iMessage"
-    guid = f"{svc};-;{_contacts(ctx).normalize(address)}"
+    resolver = _resolver(ctx)
+    if resolver is None:
+        return None
     try:
-        live = await _latest_message_ts(ctx, guid)
+        return await resolver.find_for_address(address)
     except BlueBubblesError:
-        return None  # no such chat
-    return guid if live is not None else None
+        return None
 
 
 async def _enrich(ctx: Context, data: Any) -> Any:
@@ -442,6 +470,7 @@ async def list_chats(
     data = await _bb(ctx).list_chats(
         limit=limit, offset=offset, with_fields=["lastmessage"]
     )
+    data = dedupe_chats(data, _contacts(ctx).normalize)
     return await _present(ctx, data, extended=extended)
 
 
@@ -482,6 +511,7 @@ async def get_chat_messages(
             user's own messages.
         extended: Return full raw fields instead of the compact set (default False).
     """
+    chat_guid = await _canonical_guid(ctx, chat_guid)
     data = await _bb(ctx).get_chat_messages(
         chat_guid,
         limit=_fetch_limit(limit, from_address),
@@ -639,6 +669,7 @@ async def send_message(
             "Threaded replies require the BlueBubbles Private API, which isn't "
             "enabled on this server. Send without reply_to_guid."
         )
+    chat_guid = await _canonical_guid(ctx, chat_guid)
     await _guard(ctx).check_chat(chat_guid)
     await _check_freshness(ctx, chat_guid)
     data = await _bb(ctx).send_message(
@@ -675,7 +706,7 @@ async def create_chat(
         )
     _guard(ctx).check_address(address)
     if _freshness(ctx) is not None:
-        existing = await _existing_chat_guid_for_address(ctx, address, service)
+        existing = await _existing_chat_guid_for_address(ctx, address)
         if existing:
             raise ValueError(
                 f"A conversation with this person already exists ({existing}). To "
@@ -735,6 +766,7 @@ async def send_multipart(
         chat_guid: The chat GUID to send to.
         parts: Ordered list of text and/or attachment parts (see above).
     """
+    chat_guid = await _canonical_guid(ctx, chat_guid)
     await _guard(ctx).check_chat(chat_guid)
     await _check_freshness(ctx, chat_guid)
     assembled: list[dict[str, Any]] = []
@@ -948,8 +980,8 @@ async def find_chats(ctx: Context, name: str, limit: int = 25) -> str:
         }
         if (targets & participants) or (q and q in title):
             found.append(chat)
-        if len(found) >= limit:
-            break
+    # Collapse alias rows to one chat per conversation, then cap at `limit`.
+    found = dedupe_chats(found, resolver.normalize)[:limit]
     return _fmt(await _enrich(ctx, found))
 
 
@@ -1254,6 +1286,7 @@ async def send_attachment(
         filename: The filename (e.g. 'photo.jpg').
         mime_type: MIME type (e.g. 'image/jpeg'). Defaults to 'application/octet-stream'.
     """
+    chat_guid = await _canonical_guid(ctx, chat_guid)
     await _guard(ctx).check_chat(chat_guid)
     await _check_freshness(ctx, chat_guid)
     file_data = base64.b64decode(data_base64)
