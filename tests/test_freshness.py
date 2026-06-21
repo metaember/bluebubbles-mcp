@@ -20,8 +20,11 @@ from bb_mcp.server import (
     _check_freshness,
     _record_watermark,
     create_chat,
+    get_unread_chats,
     mcp,
+    send_attachment,
     send_message,
+    send_multipart,
 )
 
 
@@ -148,11 +151,16 @@ class TestNewestMessageTs:
 
 class FakeBB:
     def __init__(
-        self, messages: list[dict], send_ts: int | None = None, raise_on_get: bool = False
+        self,
+        messages: list[dict],
+        send_ts: int | None = None,
+        raise_on_get: bool = False,
+        chats: list[dict] | None = None,
     ) -> None:
         self.messages = messages
         self.send_ts = send_ts
         self.raise_on_get = raise_on_get
+        self._chats = chats or []
         self.sent: list[tuple] = []
 
     async def get_chat_messages(self, chat_guid: str, **kwargs) -> list[dict]:
@@ -160,11 +168,22 @@ class FakeBB:
             raise BlueBubblesError("chat not found", {})
         return self.messages
 
+    async def list_chats(self, **kwargs) -> list[dict]:
+        return self._chats
+
     async def send_message(self, chat_guid: str, message: str, **kwargs) -> dict:
         self.sent.append((chat_guid, message))
         sent = {"guid": "sent-1", "isFromMe": True, "dateCreated": self.send_ts}
         self.messages = self.messages + [sent]  # the send advances the conversation
         return sent
+
+    async def send_multipart(self, chat_guid: str, parts: list, **kwargs) -> dict:
+        self.sent.append((chat_guid, "multipart"))
+        return {"guid": "mp-1", "isFromMe": True, "dateCreated": self.send_ts}
+
+    async def send_attachment(self, chat_guid: str, data, filename: str, *a, **k) -> dict:
+        self.sent.append((chat_guid, filename))
+        return {"guid": "att-1", "isFromMe": True, "dateCreated": self.send_ts}
 
     async def send_message_to_address(self, address: str, message: str, **kwargs) -> dict:
         self.sent.append((address, message))
@@ -479,3 +498,50 @@ class TestCreateChat:
         ctx = make_ctx(freshness=None, meta=None, bb=bb)
         await create_chat(ctx, self.ADDR, "hi")
         assert bb.sent == [(self.ADDR, "hi")]
+
+
+class TestOtherGatedSends:
+    """The gate is wired into every composed-content send, not just send_message."""
+
+    async def test_send_multipart_blocked_without_read(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([{"guid": "a", "isFromMe": False, "dateCreated": 100}])
+        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        with pytest.raises(FreshnessError):
+            await send_multipart(ctx, "chat-A", [{"text": "hi"}])
+        assert bb.sent == []
+
+    async def test_send_multipart_allowed_after_read(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        msgs = [{"guid": "a", "isFromMe": False, "dateCreated": 100}]
+        bb = FakeBB(msgs, send_ts=300)
+        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        _record_watermark(ctx, "chat-A", msgs)
+        await send_multipart(ctx, "chat-A", [{"text": "hi"}])
+        assert bb.sent == [("chat-A", "multipart")]
+
+    async def test_send_attachment_blocked_without_read(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([{"guid": "a", "isFromMe": False, "dateCreated": 100}])
+        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        with pytest.raises(FreshnessError):
+            await send_attachment(ctx, "chat-A", "aGk=", "f.txt")
+        assert bb.sent == []
+
+
+class TestGetUnreadChatsDoesNotRecord:
+    """get_unread_chats is a scan, not engagement — it must NOT clear a reply."""
+
+    async def test_scan_does_not_satisfy_a_later_send(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB(
+            [{"guid": "a", "isFromMe": False, "dateCreated": 100}],
+            chats=[{"guid": "chat-A", "hasUnreadMessages": True}],
+        )
+        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        await get_unread_chats(ctx)
+        # The scan surfaced chat-A but did not record a watermark, so a send into
+        # it is still blocked until the agent deliberately opens it.
+        with pytest.raises(FreshnessError):
+            await send_message(ctx, "chat-A", "hi")
+        assert bb.sent == []
