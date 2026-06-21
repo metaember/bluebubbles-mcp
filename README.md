@@ -128,6 +128,20 @@ sending into it — good hygiene for replies. Starting a brand-new conversation 
 `create_chat` is unaffected; it's for first contact only and, with the guard on,
 refuses to reach an existing chat — use `send_message` for those.)
 
+**How it works.** The guard keeps a per-agent *watermark* — the newest message each
+agent has seen in each chat (optimistic concurrency, like an `ETag` on the thread):
+
+- Reading a chat with `get_chat_messages` records the watermark. Only that tool
+  records — a scan like `get_unread_chats` doesn't — so to reply you must
+  deliberately open the actual thread.
+- Before a send, the server re-checks the chat's live newest message. If anything
+  (from anyone — the other person, you on another device, or another agent) arrived
+  since your watermark, or your read is older than the TTL, the send is **blocked**
+  with a note to re-read and re-plan.
+- Your own send advances your watermark, so sending doesn't block your next send.
+
+See [`docs/freshness-guard.md`](docs/freshness-guard.md) for the full design.
+
 **On by default.** Disable with `BLUEBUBBLES_FRESHNESS=off`. Tuning:
 
 ```jsonc
