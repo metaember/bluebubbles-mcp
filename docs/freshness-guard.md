@@ -193,6 +193,8 @@ class FreshnessTracker:
 - **Record on read** — helper `_record_watermark(ctx, chat_guid, raw_messages)` computes
   the newest message `dateCreated` over *all* senders (`newest_message_ts`: `max(dateCreated
   for m in raw_messages if "isFromMe" in m)`, else None) and calls `tracker.record(...)`.
+  The GUID is resolved before the read; the watermark belongs to the row actually read.
+  An unresolved alias retains its own GUID and cannot borrow another row's watermark.
   Called (when enabled) from **`get_chat_messages` only** — the one tool whose semantics
   are "I'm opening *this* thread to act on it." Deliberately **not**:
   - `get_unread_chats` — a scan across many chats with a shallow per-chat preview (5 msgs).
@@ -218,11 +220,16 @@ class FreshnessTracker:
                            "in light of them: your reply may need revising, or may no "
                            "longer be warranted.")
   ```
+  Guarded sends refresh chat-alias resolution before this check. If a different row
+  became the active alias, its GUID has no watermark and the send requires a new read.
+  A resolver error stops a guarded send rather than guessing a destination.
   Called at the top of: **`send_message`, `send_multipart`, `send_attachment`** (after the
   existing `_guard(ctx).check_chat(...)`). The address-based **`create_chat`** doesn't gate —
   instead, when the guard is on, it uses `_existing_chat_guid_for_address(...)` and **refuses**
   if a 1:1 chat already exists, pointing the agent to `send_message` (so every send into an
-  existing chat flows through the gated path; the address tool can't bypass it).
+  existing chat flows through the gated path; the address tool can't bypass it). Its
+  existence lookup refreshes its map, pages beyond the first 1000 chats, and stops the
+  send on lookup errors.
   - `_latest_message_ts(ctx, chat_guid)` fetches recent messages
     (`get_chat_messages(chat_guid, limit=10, sort="DESC")`) and returns the max
     `dateCreated` over all senders, or None.

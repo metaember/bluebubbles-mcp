@@ -145,6 +145,13 @@ agent has seen in each chat (optimistic concurrency, like an `ETag` on the threa
   since your watermark, or your read is older than the TTL, the send is **blocked**
   with a note to re-read and re-plan.
 - Your own send advances your watermark, so sending doesn't block your next send.
+- Watermarks key on the **resolved chat GUID**. Reads and sends resolve known aliases
+  (e.g. a stale `iMessageLite;-;` shadow) to the live row, while unresolved aliases
+  require their own read. Guarded sends refresh alias selection before sending. See
+  [`docs/canonical-chat-identity.md`](docs/canonical-chat-identity.md).
+- Trusted archival indexers can use the separately permissionable read-only
+  `list_chat_aliases` and `get_chat_alias_messages` tools to inspect exact physical
+  rows without changing send freshness; normal agent tools remain canonicalized.
 
 See [`docs/freshness-guard.md`](docs/freshness-guard.md) for the full design.
 
@@ -192,8 +199,10 @@ correct in both 1:1 and group chats.
 | `get_server_info` | Server info and health | read-only |
 | `get_my_address` | The user's own iMessage address (to identify their own messages) | read-only |
 | `list_chats` | List conversations by recent activity | read-only |
+| `list_chat_aliases` | Physical chat rows for trusted archival indexers | read-only |
 | `get_chat` | Chat details with participants | read-only |
 | `get_chat_messages` | Messages from a chat | read-only |
+| `get_chat_alias_messages` | Messages from one exact physical chat row | read-only |
 | `search_messages` | Search by text, chat, time range | read-only |
 | `get_message` | Single message by GUID | read-only |
 | `get_contacts` | All contacts | read-only |

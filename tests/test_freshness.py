@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from bb_mcp.freshness import (
     newest_message_ts,
 )
 from bb_mcp.client import BlueBubblesError
+from bb_mcp.chats import ChatResolver
 from bb_mcp.server import (
     _agent_id,
     _assert_freshness_transport_compatible,
@@ -20,7 +22,10 @@ from bb_mcp.server import (
     _check_freshness,
     _record_watermark,
     create_chat,
+    get_chat_alias_messages,
+    get_chat_messages,
     get_unread_chats,
+    list_chat_aliases,
     mcp,
     send_attachment,
     send_message,
@@ -156,20 +161,27 @@ class FakeBB:
         send_ts: int | None = None,
         raise_on_get: bool = False,
         chats: list[dict] | None = None,
+        views: dict[str, list[dict]] | None = None,
     ) -> None:
         self.messages = messages
         self.send_ts = send_ts
         self.raise_on_get = raise_on_get
         self._chats = chats or []
+        self.views = views or {}  # per-guid message sets (aliases differ)
         self.sent: list[tuple] = []
+        self.read_guids: list[str] = []
+        self.list_calls: list[dict] = []
 
     async def get_chat_messages(self, chat_guid: str, **kwargs) -> list[dict]:
         if self.raise_on_get:
             raise BlueBubblesError("chat not found", {})
-        return self.messages
+        self.read_guids.append(chat_guid)
+        return self.views.get(chat_guid, self.messages)
 
     async def list_chats(self, **kwargs) -> list[dict]:
-        return self._chats
+        self.list_calls.append(kwargs)
+        offset = kwargs.get("offset", 0)
+        return self._chats[offset:offset + kwargs.get("limit", len(self._chats))]
 
     async def send_message(self, chat_guid: str, message: str, **kwargs) -> dict:
         self.sent.append((chat_guid, message))
@@ -203,18 +215,35 @@ class FakeContacts:
         return address
 
 
+class FakeResolver:
+    """Identity resolver by default; `existing` addresses report a prior chat."""
+
+    def __init__(self, existing=(), canonical=None) -> None:
+        self.existing = set(existing)
+        self.canonical = canonical or {}
+
+    async def canonical_guid(self, guid: str, *, refresh: bool = False) -> str:
+        return self.canonical.get(guid, guid)
+
+    async def find_for_address(self, address: str, *, refresh: bool = False):
+        return f"iMessage;-;{address}" if address in self.existing else None
+
+
 def make_ctx(*, freshness=None, meta=None, bb=None, private_api=True,
-             identity="meta", session=None):
+             identity="meta", session=None, resolver=None):
     meta_obj = RequestParams.Meta.model_validate(meta) if meta is not None else None
+    lifespan = {
+        "freshness": freshness,
+        "freshness_identity": identity,
+        "bb": bb,
+        "guard": FakeGuard(),
+        "contacts": FakeContacts(),
+        "private_api": private_api,
+    }
+    if resolver is not None:
+        lifespan["chat_resolver"] = resolver
     request_context = SimpleNamespace(
-        lifespan_context={
-            "freshness": freshness,
-            "freshness_identity": identity,
-            "bb": bb,
-            "guard": FakeGuard(),
-            "contacts": FakeContacts(),
-            "private_api": private_api,
-        },
+        lifespan_context=lifespan,
         meta=meta_obj,
         session=session if session is not None else SimpleNamespace(),
     )
@@ -462,7 +491,6 @@ class TestSessionModeFlow:
             await send_message(ctx, "chat-A", "hi")
         assert bb.sent == []
 
-
 class TestCreateChat:
     """create_chat is for NEW conversations only: with the guard on it refuses to
     reach an existing 1:1 chat (closing the address-path bypass) and points the agent
@@ -470,34 +498,224 @@ class TestCreateChat:
 
     ADDR = "+15551234567"
 
-    async def test_existing_chat_is_refused(self) -> None:
+    async def test_existing_chat_under_any_alias_is_refused(self) -> None:
+        # Resolver reports a prior conversation (under any service) -> refuse.
         tracker = FreshnessTracker(clock=FakeClock())
-        bb = FakeBB([{"guid": "a", "isFromMe": False, "dateCreated": 100}])
-        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        bb = FakeBB([])
+        ctx = make_ctx(
+            identity="session", freshness=tracker, meta=None, bb=bb,
+            resolver=FakeResolver(existing={self.ADDR}),
+        )
         with pytest.raises(ValueError, match="already exists"):
             await create_chat(ctx, self.ADDR, "hi")
         assert bb.sent == []
 
-    async def test_first_contact_no_history_is_allowed(self) -> None:
+    async def test_first_contact_is_allowed(self) -> None:
         tracker = FreshnessTracker(clock=FakeClock())
-        bb = FakeBB([])  # no existing conversation
-        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
+        bb = FakeBB([])
+        ctx = make_ctx(
+            identity="session", freshness=tracker, meta=None, bb=bb,
+            resolver=FakeResolver(),  # no existing conversation
+        )
         await create_chat(ctx, self.ADDR, "hi")
         assert bb.sent == [(self.ADDR, "hi")]
 
-    async def test_first_contact_no_chat_is_allowed(self) -> None:
-        tracker = FreshnessTracker(clock=FakeClock())
-        bb = FakeBB([], raise_on_get=True)  # chat lookup 404s -> truly new
-        ctx = make_ctx(identity="session", freshness=tracker, meta=None, bb=bb)
-        await create_chat(ctx, self.ADDR, "hi")
-        assert bb.sent == [(self.ADDR, "hi")]
+    async def test_older_existing_chat_is_refused(self) -> None:
+        filler = [
+            {"guid": f"iMessage;-;+1999{i:04d}",
+             "participants": [{"address": f"+1999{i:04d}"}],
+             "lastMessage": {"dateCreated": 2000 - i}}
+            for i in range(1000)
+        ]
+        existing = {
+            "guid": f"iMessage;-;{self.ADDR}",
+            "participants": [{"address": self.ADDR}],
+            "lastMessage": {"dateCreated": 1},
+        }
+        bb = FakeBB([], chats=filler + [existing])
+        ctx = make_ctx(
+            identity="session", freshness=FreshnessTracker(clock=FakeClock()),
+            bb=bb, resolver=ChatResolver(bb, FakeContacts().normalize),
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            await create_chat(ctx, self.ADDR, "hi")
+        assert bb.sent == []
+
+    async def test_lookup_error_blocks_first_contact_send(self) -> None:
+        class FailedLookup(FakeResolver):
+            async def find_for_address(self, address: str, *, refresh: bool = False):
+                raise BlueBubblesError("chat enumeration failed")
+
+        bb = FakeBB([])
+        ctx = make_ctx(
+            identity="session", freshness=FreshnessTracker(clock=FakeClock()),
+            bb=bb, resolver=FailedLookup(),
+        )
+        with pytest.raises(BlueBubblesError):
+            await create_chat(ctx, self.ADDR, "hi")
+        assert bb.sent == []
 
     async def test_disabled_guard_skips_existence_check(self) -> None:
         # Guard off -> no bypass to prevent, so create_chat doesn't probe/refuse.
-        bb = FakeBB([{"guid": "a", "isFromMe": False, "dateCreated": 100}])
-        ctx = make_ctx(freshness=None, meta=None, bb=bb)
+        bb = FakeBB([])
+        ctx = make_ctx(
+            freshness=None, meta=None, bb=bb, resolver=FakeResolver(existing={self.ADDR})
+        )
         await create_chat(ctx, self.ADDR, "hi")
         assert bb.sent == [(self.ADDR, "hi")]
+
+
+class TestAliasResolutionIntegration:
+    """The iMessageLite duality: a conversation reachable under a stale alias GUID
+    and a live canonical GUID. Reads/sends resolve to canonical and the watermark
+    keys on the resolved GUID, so reading under a known alias clears a send under
+    another known alias — and the stale-shadow false-"moved" reject is gone."""
+
+    NUM = "+15550100"
+    LITE = f"iMessageLite;-;{NUM}"   # stale shadow: one old message
+    CANON = f"iMessage;-;{NUM}"      # live thread: full history
+
+    OLD = {"guid": "m1", "isFromMe": False, "dateCreated": 100}
+    NEW = {"guid": "m2", "isFromMe": False, "dateCreated": 900}
+
+    def _ctx(self, tracker):
+        bb = FakeBB(
+            [], send_ts=1000,
+            views={self.LITE: [self.OLD], self.CANON: [self.OLD, self.NEW]},
+        )
+        # The alias resolves to the live canonical chat.
+        ctx = make_ctx(
+            identity="session", freshness=tracker, meta=None, bb=bb,
+            resolver=FakeResolver(canonical={self.LITE: self.CANON}),
+        )
+        return ctx, bb
+
+    async def test_read_stale_alias_then_send_does_not_false_reject(self) -> None:
+        # The reported regression: reading the iMessageLite shadow used to record a
+        # stale watermark; now the read resolves to the canonical live thread, so the
+        # send is not falsely blocked as "conversation moved".
+        tracker = FreshnessTracker(clock=FakeClock())
+        ctx, bb = self._ctx(tracker)
+        await get_chat_messages(ctx, self.LITE)      # -> reads canonical (ts=900)
+        await send_message(ctx, self.CANON, "yo")
+        assert bb.sent == [(self.CANON, "yo")]
+
+    async def test_alias_read_clears_canonical_send(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        ctx, bb = self._ctx(tracker)
+        await get_chat_messages(ctx, self.LITE)
+        await send_message(ctx, self.CANON, "hi")
+        assert bb.sent == [(self.CANON, "hi")]
+
+    async def test_canonical_read_clears_alias_send(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        ctx, bb = self._ctx(tracker)
+        await get_chat_messages(ctx, self.CANON)
+        await send_message(ctx, self.LITE, "hi")     # alias send resolves to canonical
+        assert bb.sent == [(self.CANON, "hi")]
+
+    async def test_distinct_people_do_not_collide(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        ctx, bb = self._ctx(tracker)
+        await get_chat_messages(ctx, self.CANON)     # read this person
+        with pytest.raises(FreshnessError):          # send to a different person
+            await send_message(ctx, "iMessage;-;+15550999", "hi")
+        assert bb.sent == []
+
+
+    async def test_unresolved_alias_cannot_borrow_live_watermark(self) -> None:
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB(
+            [], send_ts=1000,
+            views={self.LITE: [self.OLD], self.CANON: [self.OLD, self.NEW]},
+        )
+        ctx = make_ctx(
+            identity="session", freshness=tracker, bb=bb, resolver=FakeResolver(),
+        )
+        await get_chat_messages(ctx, self.CANON)
+        with pytest.raises(FreshnessError):
+            await send_message(ctx, self.LITE, "hi")
+        assert bb.sent == []
+
+    async def test_resolution_error_blocks_guarded_send(self) -> None:
+        class FailedRefresh(FakeResolver):
+            async def canonical_guid(self, guid: str, *, refresh: bool = False) -> str:
+                if refresh:
+                    raise BlueBubblesError("chat enumeration failed")
+                return guid
+
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([], views={self.CANON: [self.OLD, self.NEW]})
+        ctx = make_ctx(
+            identity="session", freshness=tracker, bb=bb, resolver=FailedRefresh(),
+        )
+        await get_chat_messages(ctx, self.CANON)
+        with pytest.raises(FreshnessError, match="Could not verify"):
+            await send_message(ctx, self.CANON, "hi")
+        assert bb.sent == []
+
+    async def test_newly_active_alias_blocks_send_after_refresh(self) -> None:
+        live = {"guid": self.CANON, "participants": [{"address": self.NUM}],
+                "lastMessage": {"dateCreated": 900}}
+        shadow = {"guid": self.LITE, "participants": [{"address": self.NUM}],
+                  "lastMessage": {"dateCreated": 100}}
+        bb = FakeBB(
+            [], views={self.CANON: [self.OLD, self.NEW], self.LITE: [self.OLD]},
+            chats=[live, shadow],
+        )
+        ctx = make_ctx(
+            identity="session", freshness=FreshnessTracker(clock=FakeClock()),
+            bb=bb, resolver=ChatResolver(bb, FakeContacts().normalize),
+        )
+        await get_chat_messages(ctx, self.CANON)
+        shadow["lastMessage"]["dateCreated"] = 950
+        bb.views[self.LITE] = [self.OLD, {"guid": "m3", "dateCreated": 950}]
+        with pytest.raises(FreshnessError):
+            await send_message(ctx, self.CANON, "hi")
+        assert bb.sent == []
+
+
+class TestArchivalAliasReads:
+    """The archival surface preserves physical rows without weakening send safety."""
+
+    async def test_lists_raw_alias_rows_without_deduplication(self) -> None:
+        chats = [
+            {"guid": "iMessage;-;+15550100"},
+            {"guid": "SMS;-;+15550100"},
+        ]
+        bb = FakeBB([], chats=chats)
+        ctx = make_ctx(bb=bb, identity="session")
+
+        data = await list_chat_aliases(ctx, limit=2, offset=0, extended=True)
+
+        assert [row["guid"] for row in json.loads(data)] == [
+            "iMessage;-;+15550100",
+            "SMS;-;+15550100",
+        ]
+        assert bb.list_calls == [{
+            "limit": 2,
+            "offset": 0,
+            "with_fields": ["participants", "lastmessage"],
+        }]
+
+    async def test_exact_alias_read_does_not_record_send_watermark(self) -> None:
+        stale = "SMS;-;+15550100"
+        live = "iMessage;-;+15550100"
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([], views={stale: [{"guid": "old", "isFromMe": False,
+                                       "dateCreated": 100}]})
+        ctx = make_ctx(
+            bb=bb,
+            freshness=tracker,
+            identity="session",
+            resolver=FakeResolver(canonical={stale: live}),
+        )
+
+        await get_chat_alias_messages(ctx, stale, extended=True)
+
+        assert bb.read_guids == [stale]
+        with pytest.raises(FreshnessError):
+            tracker.last_seen("session", stale)
 
 
 class TestOtherGatedSends:
