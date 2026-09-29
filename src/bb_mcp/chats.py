@@ -11,10 +11,9 @@ row.
 We treat a conversation as **service-agnostic**: one identity per participant (1:1)
 or per group id, regardless of service. Two jobs live here:
 
-- :func:`canonical_chat_key` — a pure, service-agnostic key for the freshness
-  watermark, so a read under any alias counts for a send under any alias. Fail-safe:
-  an unparseable GUID keys on its raw self (distinct, never merges → never
-  manufactures a false "fresh" state).
+- :func:`canonical_chat_key` — a pure, service-agnostic key for deduplicating
+  chat listings. Freshness uses the resolved GUID itself, so an unresolved alias
+  cannot borrow a different row's watermark.
 - :class:`ChatResolver` — resolves an alias GUID to the **live canonical chat**
   (most-recent row for the participant, iMessage-family preferred), so reads and
   sends land on the real thread instead of the stale shadow. Enumerates ``/chat/query``
@@ -29,6 +28,7 @@ import asyncio
 import time
 from typing import Any, Callable
 
+from bb_mcp.client import BlueBubblesError
 from bb_mcp.policy import address_from_guid
 
 # Lower rank wins when two rows for one participant are equally recent. iMessage
@@ -37,6 +37,8 @@ _SERVICE_RANK = {"imessage": 0, "any": 0, "imessagelite": 1, "rcs": 2, "sms": 3}
 _DEFAULT_RANK = 4
 
 DEFAULT_RESOLVE_TTL_SECONDS = 60.0
+_RESOLVE_PAGE_SIZE = 1000
+_LIST_PAGE_SIZE = 100
 
 
 def _split(guid: str) -> list[str]:
@@ -95,6 +97,28 @@ def dedupe_chats(
     return [best[key] for key in order]
 
 
+async def list_unique_chats(
+    client: Any, normalize: Callable[[str], str], limit: int, offset: int
+) -> list[dict[str, Any]]:
+    """Apply offset and limit to conversations, not raw alias rows."""
+    if limit <= 0:
+        return []
+    unique: list[dict[str, Any]] = []
+    raw_offset = 0
+    end = offset + limit
+    while len(unique) < end:
+        page = await client.list_chats(
+            limit=_LIST_PAGE_SIZE, offset=raw_offset, with_fields=["lastmessage"]
+        ) or []
+        if not page:
+            break
+        unique = dedupe_chats(unique + page, normalize)
+        raw_offset += len(page)
+        if len(page) < _LIST_PAGE_SIZE:
+            break
+    return unique[offset:end]
+
+
 class ChatResolver:
     """Resolves alias chat GUIDs to the live canonical chat for a conversation.
 
@@ -102,8 +126,8 @@ class ChatResolver:
     participant, breaking ties by service preference (iMessage-family over the
     iMessageLite shadow / SMS / RCS). Group and unparseable GUIDs resolve to
     themselves (group aliasing across services is rare). The alias→canonical map is
-    built from one ``/chat/query`` enumeration and reused for ``ttl_seconds`` so reads
-    and sends don't each pay an enumeration.
+    built from one ``/chat/query`` enumeration and cached for reads. Guarded sends
+    refresh it so a newly active alias cannot be missed.
     """
 
     def __init__(
@@ -120,21 +144,28 @@ class ChatResolver:
         self._guid_to_canonical: dict[str, str] = {}
         self._addr_to_canonical: dict[str, str] = {}
         self._built_at: float | None = None
+        self._first_page_full = False
         self._lock = asyncio.Lock()
 
     def _is_cache_fresh(self) -> bool:
         return self._built_at is not None and self._clock() - self._built_at <= self._ttl
 
-    async def _ensure_fresh(self) -> None:
-        if self._is_cache_fresh():
+    async def _ensure_fresh(self, *, force: bool = False) -> None:
+        if not force and self._is_cache_fresh():
             return
         async with self._lock:
-            if self._is_cache_fresh():  # built by another coroutine while we waited
+            if not force and self._is_cache_fresh():  # built while we waited
                 return
-            # `list_chats` can return None on an empty/edge response; never iterate None.
             chats = await self._client.list_chats(
-                limit=1000, sort="lastmessage", with_fields=["participants", "lastmessage"]
-            ) or []
+                limit=_RESOLVE_PAGE_SIZE,
+                sort="lastmessage",
+                with_fields=["participants", "lastmessage"],
+            )
+            if chats is None:
+                if force:
+                    raise BlueBubblesError("Chat enumeration unavailable")
+                chats = []
+            self._first_page_full = len(chats) == _RESOLVE_PAGE_SIZE
             self._rebuild(chats)
 
     def _rebuild(self, chats: list[dict[str, Any]]) -> None:
@@ -174,19 +205,46 @@ class ChatResolver:
         address = address_from_guid(guid)
         return self._normalize(address) if address else None
 
-    async def canonical_guid(self, guid: str) -> str:
+    async def canonical_guid(self, guid: str, *, refresh: bool = False) -> str:
         """The live canonical GUID for ``guid``'s conversation.
 
-        Group/unparseable GUIDs and 1:1s with no other known alias resolve to
-        themselves (fail-safe — never invents a target).
+        Group/unparseable GUIDs resolve to themselves. An unlisted 1:1 alias can
+        use a known address mapping; otherwise it keeps its own GUID.
         """
         if not _is_one_to_one(guid):
             return guid
-        await self._ensure_fresh()
-        return self._guid_to_canonical.get(guid, guid)
+        await self._ensure_fresh(force=refresh)
+        address = address_from_guid(guid)
+        assert address is not None
+        return self._guid_to_canonical.get(guid) or self._addr_to_canonical.get(
+            self._normalize(address)
+        ) or guid
 
-    async def find_for_address(self, address: str) -> str | None:
-        """The canonical GUID of an existing 1:1 conversation with ``address``,
+    async def find_for_address(self, address: str, *, refresh: bool = False) -> str | None:
+        """A GUID of an existing 1:1 conversation with ``address``,
         or ``None`` if the person has no chat yet (so a new one may be started)."""
-        await self._ensure_fresh()
-        return self._addr_to_canonical.get(self._normalize(address))
+        await self._ensure_fresh(force=refresh)
+        normalized = self._normalize(address)
+        known = self._addr_to_canonical.get(normalized)
+        if known or not self._first_page_full:
+            return known
+
+        # An old conversation may be past the first page. `create_chat` must not
+        # treat a truncated enumeration as proof that it is a first contact.
+        offset = _RESOLVE_PAGE_SIZE
+        while True:
+            page = await self._client.list_chats(
+                limit=_RESOLVE_PAGE_SIZE,
+                offset=offset,
+                sort="lastmessage",
+                with_fields=["participants", "lastmessage"],
+            )
+            if page is None:
+                raise BlueBubblesError("Chat enumeration unavailable")
+            for chat in page:
+                guid = chat.get("guid") or ""
+                if _is_one_to_one(guid) and self._chat_address(chat, guid) == normalized:
+                    return guid
+            if len(page) < _RESOLVE_PAGE_SIZE:
+                return None
+            offset += len(page)

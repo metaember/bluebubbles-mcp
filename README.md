@@ -145,9 +145,9 @@ agent has seen in each chat (optimistic concurrency, like an `ETag` on the threa
   since your watermark, or your read is older than the TTL, the send is **blocked**
   with a note to re-read and re-plan.
 - Your own send advances your watermark, so sending doesn't block your next send.
-- Watermarks key on a **service-agnostic conversation identity**, and reads/sends
-  resolve alias chat GUIDs (e.g. a stale `iMessageLite;-;` shadow) to the live
-  canonical chat — so a read under any alias counts for a send under any other. See
+- Watermarks key on the **resolved chat GUID**. Reads and sends resolve known aliases
+  (e.g. a stale `iMessageLite;-;` shadow) to the live row, while unresolved aliases
+  require their own read. Guarded sends refresh alias selection before sending. See
   [`docs/canonical-chat-identity.md`](docs/canonical-chat-identity.md).
 
 See [`docs/freshness-guard.md`](docs/freshness-guard.md) for the full design.

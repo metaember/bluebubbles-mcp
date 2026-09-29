@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from bb_mcp.chats import ChatResolver, canonical_chat_key, dedupe_chats
+from bb_mcp.client import BlueBubblesError
+from bb_mcp.chats import ChatResolver, canonical_chat_key, dedupe_chats, list_unique_chats
 
 NORM = lambda a: a.strip().lower()  # noqa: E731 - simple passthrough normalizer
 
@@ -27,7 +28,10 @@ class FakeClient:
 
     async def list_chats(self, **kwargs) -> list[dict]:
         self.list_calls += 1
-        return self.chats
+        if self.chats is None:
+            return None
+        offset = kwargs.get("offset", 0)
+        return self.chats[offset:offset + kwargs.get("limit", len(self.chats))]
 
 
 def chat(guid: str, address: str, last_ts: int) -> dict:
@@ -138,6 +142,49 @@ class TestChatResolver:
         assert await r.canonical_guid("iMessage;-;+15550006") == "iMessage;-;+15550006"
         assert await r.find_for_address("+15550006") is None
 
+    async def test_forced_refresh_rejects_missing_enumeration(self) -> None:
+        client = FakeClient(None)  # type: ignore[arg-type]
+        r = ChatResolver(client, NORM, clock=FakeClock())
+        with pytest.raises(BlueBubblesError, match="enumeration unavailable"):
+            await r.canonical_guid("iMessage;-;+15550006", refresh=True)
+        with pytest.raises(BlueBubblesError, match="enumeration unavailable"):
+            await r.find_for_address("+15550006", refresh=True)
+
+    async def test_unknown_alias_uses_known_address(self) -> None:
+        client = FakeClient([chat("iMessage;-;+15550009", "+15550009", 900)])
+        r = ChatResolver(client, NORM, clock=FakeClock())
+        assert await r.canonical_guid("iMessageLite;-;+15550009") == (
+            "iMessage;-;+15550009"
+        )
+
+    async def test_refresh_sees_newly_active_alias(self) -> None:
+        live = chat("iMessage;-;+15550010", "+15550010", 900)
+        newly_active = chat("SMS;-;+15550010", "+15550010", 100)
+        client = FakeClient([live, newly_active])
+        r = ChatResolver(client, NORM, clock=FakeClock())
+        assert await r.canonical_guid(live["guid"]) == live["guid"]
+        newly_active["lastMessage"]["dateCreated"] = 950
+        assert await r.canonical_guid(live["guid"], refresh=True) == newly_active["guid"]
+        assert client.list_calls == 2
+
+    async def test_find_for_address_searches_beyond_first_thousand(self) -> None:
+        filler = [chat(f"iMessage;-;+1999{i:04d}", f"+1999{i:04d}", 2000 - i)
+                  for i in range(1000)]
+        target = chat("iMessage;-;+15550011", "+15550011", 1)
+        client = FakeClient(filler + [target])
+        r = ChatResolver(client, NORM, clock=FakeClock())
+        assert await r.find_for_address("+15550011") == target["guid"]
+        assert client.list_calls == 2
+
+    async def test_find_for_address_refreshes_cached_absence(self) -> None:
+        client = FakeClient([])
+        r = ChatResolver(client, NORM, clock=FakeClock())
+        assert await r.find_for_address("+15550012") is None
+        new_chat = chat("iMessage;-;+15550012", "+15550012", 100)
+        client.chats = [new_chat]
+        assert await r.find_for_address("+15550012", refresh=True) == new_chat["guid"]
+        assert client.list_calls == 2
+
 
 class TestDedupeChats:
     def test_collapses_alias_rows_keeping_most_recent(self) -> None:
@@ -153,3 +200,29 @@ class TestDedupeChats:
     def test_none_and_empty(self) -> None:
         assert dedupe_chats(None, NORM) == []  # type: ignore[arg-type]
         assert dedupe_chats([], NORM) == []
+
+
+class TestUniqueChatPagination:
+    async def test_dedupes_before_offset_and_limit(self, monkeypatch) -> None:
+        monkeypatch.setattr("bb_mcp.chats._LIST_PAGE_SIZE", 2)
+        rows = [
+            chat("iMessage;-;+15550001", "+15550001", 400),
+            chat("iMessage;-;+15550002", "+15550002", 300),
+            chat("iMessageLite;-;+15550001", "+15550001", 200),
+            chat("iMessage;-;+15550003", "+15550003", 100),
+        ]
+        client = FakeClient(rows)
+        first = await list_unique_chats(client, NORM, limit=2, offset=0)
+        second = await list_unique_chats(client, NORM, limit=2, offset=2)
+        assert [row["guid"] for row in first] == [rows[0]["guid"], rows[1]["guid"]]
+        assert [row["guid"] for row in second] == [rows[3]["guid"]]
+
+    async def test_fills_page_after_alias_is_removed(self, monkeypatch) -> None:
+        monkeypatch.setattr("bb_mcp.chats._LIST_PAGE_SIZE", 2)
+        rows = [
+            chat("iMessage;-;+15550001", "+15550001", 400),
+            chat("iMessageLite;-;+15550001", "+15550001", 300),
+            chat("iMessage;-;+15550002", "+15550002", 200),
+        ]
+        result = await list_unique_chats(FakeClient(rows), NORM, limit=2, offset=0)
+        assert [row["guid"] for row in result] == [rows[0]["guid"], rows[2]["guid"]]

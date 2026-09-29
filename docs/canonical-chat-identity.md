@@ -44,25 +44,24 @@ rows that have divergent message views:
 
 ## The fix
 
-We treat a conversation as **service-agnostic: one identity per participant (1:1) or
-group id.** (Decision: iMessage / SMS / RCS / `any` / `iMessageLite` to one number are
-**one** conversation — matches Apple's merged-thread UX, and is the conservative
-direction for freshness since a read under any service counts as having seen that
-person's latest.)
+We group chat listings by participant (1:1) or group id, then resolve known aliases
+to the most recently active row before a read or send. A freshness watermark belongs
+to the **resolved row's GUID**, so an unresolved alias cannot borrow another row's
+watermark.
 
 Two pieces, in `bb_mcp/chats.py`:
 
-1. **`canonical_chat_key(guid, normalize)`** — the service-agnostic key the watermark is
-   stored under:
+1. **`canonical_chat_key(guid, normalize)`** — the service-agnostic key used to
+   deduplicate chat listings:
    - 1:1 → `1:1:<normalized address>`
    - group → `group:<id>` (service stripped)
-   - unparseable → `raw:<guid>` (**fail-safe**: distinct, never merges → never
-     manufactures a false "fresh")
+   - unparseable → `raw:<guid>` (distinct, never merges)
 2. **`ChatResolver`** — resolves an alias GUID to the **live canonical chat**: among the
    participant's rows, the most recent, breaking ties by service preference
    (`iMessage`/`any` > `iMessageLite` > `RCS` > `SMS`). Built from one `/chat/query`
-   enumeration, cached ~60s (chat topology is global and rarely changes). Group and
-   unknown GUIDs resolve to themselves.
+   enumeration, cached ~60s for reads. A guarded send refreshes that enumeration so
+   newly active aliases are considered. A GUID outside the first page can still use
+   the known mapping for its embedded address; otherwise it resolves to itself.
 
 Wired into `server.py`:
 
@@ -70,35 +69,30 @@ Wired into `server.py`:
   not the stale shadow — and records the watermark from what it actually saw.
 - **`send_message` / `send_multipart` / `send_attachment`** resolve before the freshness
   check and the send, so they compare and deliver against the canonical chat.
-- **Freshness** keys on `canonical_chat_key`, so a read under any alias clears a send under
-  any alias (record and check normalize identically).
+- **Freshness** keys on the resolved GUID. Known aliases converge on one row and share
+  its watermark; an unresolved alias keeps a separate watermark and requires its own
+  read. A guarded send stops if the resolver cannot refresh.
 - **`create_chat`** checks existence via `ChatResolver.find_for_address` (participant
-  match), so it refuses an existing chat under *any* service alias, not just a constructed
-  `iMessage` GUID.
-- **`list_chats` / `find_chats`** dedupe alias rows (`dedupe_chats`) so the agent is handed
-  one stable GUID per conversation and never sees the shadow.
+  match), refreshing its map and paging past the first 1000 rows on a miss. It refuses
+  an existing chat under any service alias and stops if the lookup fails.
+- **`list_chats` / `find_chats`** dedupe alias rows (`dedupe_chats`). `list_chats`
+  applies offset and limit after deduplication, so pages do not repeat aliases.
 
 ### Fail-closed guarantees (preserved)
 
-- An unparseable/unknown GUID keys on its **raw self** → distinct → forces a re-read,
-  never merges with another conversation.
-- Resolver errors fall back to the **input GUID** (never invents a target).
-- Aliasing can only ever cause a *re-read* (safe), never a false "fresh" send.
+- An unresolved GUID keys on its **raw self** for freshness. A read of another alias
+  cannot authorize a send through it.
+- Resolver errors fall back to the input GUID for reads; guarded sends stop instead.
+- A guarded send refreshes alias selection before comparing the watermark. If another
+  row became the most recent, its different GUID requires a re-read.
 
 ## Residual edges (documented, not bugs)
 
-- **Resolution is best-effort & TTL-cached (~60s).** A brand-new alias appearing
-  mid-window resolves to itself until the cache refreshes — worst case a re-read, never a
-  bypass.
-- **The enumeration caps at the 1000 most-recently-active chats.** A conversation whose
-  rows all fall outside that window won't be in the alias map and resolves to itself
-  (soft-fail to old behavior for the long tail; never a bypass).
-- **The live freshness check is scoped to the canonical row.** Within the merged
-  conversation, a barge-in that lands on a *non-canonical* alias (e.g. the person texts
-  via SMS while the canonical thread is iMessage) is invisible until the canonical flips
-  to that row on the next resolution refresh (≤ TTL). Bounded under-protection on a
-  cooperative guardrail; a deeper fix would union the live check across the person's rows.
-- **Group aliasing** across services (rare) isn't resolved; groups key on their opaque id.
-- **SMS vs iMessage to one number share a watermark** by design. If someone genuinely has
-  independent active SMS *and* iMessage threads with unseen messages in one, a read of the
-  other counts — mild under-protection on a cooperative guardrail.
+- **The alias map covers the 1000 most recently active chats.** Older GUIDs resolve
+  through a known address when possible, or keep their raw identity. The `create_chat`
+  existence check continues through older pages before allowing a first-contact send.
+- **The live freshness check reads the selected row.** If two independently active
+  services have messages with equal timestamps, selection may still prefer one row.
+  The guard also cannot close the interval between its final check and the send without
+  an atomic BlueBubbles API operation.
+- **Group aliasing** across services (rare) is not resolved; groups retain their GUID.

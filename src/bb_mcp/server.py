@@ -21,7 +21,7 @@ from bb_mcp.capabilities import (
     private_api_from_info,
 )
 from bb_mcp.client import BlueBubblesClient, BlueBubblesError
-from bb_mcp.chats import ChatResolver, canonical_chat_key, dedupe_chats
+from bb_mcp.chats import ChatResolver, dedupe_chats, list_unique_chats
 from bb_mcp.contacts import (
     ContactResolver,
     collect_addresses,
@@ -224,26 +224,24 @@ def _resolver(ctx: Context) -> ChatResolver | None:
     return ctx.request_context.lifespan_context.get("chat_resolver")
 
 
-async def _canonical_guid(ctx: Context, chat_guid: str) -> str:
+async def _canonical_guid(ctx: Context, chat_guid: str, *, for_send: bool = False) -> str:
     """Resolve an alias GUID (iMessageLite/any/SMS/...) to the live canonical chat,
-    so reads and sends land on the real thread, not a stale shadow row. Falls back to
-    the input GUID if no resolver is configured or nothing resolves (fail-safe)."""
+    so reads and sends land on the real thread, not a stale shadow row. Refresh the
+    mapping before guarded sends so a newly active alias cannot be missed."""
     resolver = _resolver(ctx)
     if resolver is None:
         return chat_guid
     try:
-        return await resolver.canonical_guid(chat_guid)
+        return await resolver.canonical_guid(
+            chat_guid, refresh=for_send and _freshness(ctx) is not None
+        )
     except BlueBubblesError:
-        # Degrade to the input GUID rather than fail the read/send — but log it,
-        # since this can route to a stale alias row (the bug resolution prevents).
+        if for_send and _freshness(ctx) is not None:
+            raise FreshnessError(
+                "Could not verify the current conversation. Read it again before sending."
+            ) from None
         logger.warning("Chat resolution failed for %s; using it unresolved", chat_guid)
         return chat_guid
-
-
-def _watermark_key(ctx: Context, chat_guid: str) -> str:
-    """The service-agnostic canonical key the freshness watermark is stored under, so
-    a read under any alias counts for a send under any alias to the same person."""
-    return canonical_chat_key(chat_guid, _contacts(ctx).normalize)
 
 
 def _freshness(ctx: Context) -> FreshnessTracker | None:
@@ -286,9 +284,7 @@ def _record_watermark(ctx: Context, chat_guid: str, raw_messages: Any) -> None:
     tracker = _freshness(ctx)
     if tracker is None:
         return
-    tracker.record(
-        _agent_id(ctx), _watermark_key(ctx, chat_guid), newest_message_ts(raw_messages)
-    )
+    tracker.record(_agent_id(ctx), chat_guid, newest_message_ts(raw_messages))
 
 
 async def _record_sent(ctx: Context, chat_guid: str, sent: Any) -> None:
@@ -304,7 +300,7 @@ async def _record_sent(ctx: Context, chat_guid: str, sent: Any) -> None:
     ts = sent.get("dateCreated") if isinstance(sent, dict) else None
     if ts is None:
         ts = await _latest_message_ts(ctx, chat_guid)
-    tracker.record(_agent_id(ctx), _watermark_key(ctx, chat_guid), ts)
+    tracker.record(_agent_id(ctx), chat_guid, ts)
 
 
 async def _latest_message_ts(ctx: Context, chat_guid: str) -> int | None:
@@ -319,7 +315,7 @@ async def _check_freshness(ctx: Context, chat_guid: str) -> None:
     tracker = _freshness(ctx)
     if tracker is None:
         return
-    expected = tracker.last_seen(_agent_id(ctx), _watermark_key(ctx, chat_guid))
+    expected = tracker.last_seen(_agent_id(ctx), chat_guid)
     live = await _latest_message_ts(ctx, chat_guid)
     if live is not None and (expected is None or live > expected):
         raise FreshnessError(
@@ -340,11 +336,8 @@ async def _existing_chat_guid_for_address(ctx: Context, address: str) -> str | N
     """
     resolver = _resolver(ctx)
     if resolver is None:
-        return None
-    try:
-        return await resolver.find_for_address(address)
-    except BlueBubblesError:
-        return None
+        raise FreshnessError("Could not verify whether this conversation already exists.")
+    return await resolver.find_for_address(address, refresh=True)
 
 
 async def _enrich(ctx: Context, data: Any) -> Any:
@@ -472,10 +465,9 @@ async def list_chats(
         offset: Pagination offset.
         extended: Return full raw fields instead of the compact set (default False).
     """
-    data = await _bb(ctx).list_chats(
-        limit=limit, offset=offset, with_fields=["lastmessage"]
+    data = await list_unique_chats(
+        _bb(ctx), _contacts(ctx).normalize, limit, offset
     )
-    data = dedupe_chats(data, _contacts(ctx).normalize)
     return await _present(ctx, data, extended=extended)
 
 
@@ -674,7 +666,7 @@ async def send_message(
             "Threaded replies require the BlueBubbles Private API, which isn't "
             "enabled on this server. Send without reply_to_guid."
         )
-    chat_guid = await _canonical_guid(ctx, chat_guid)
+    chat_guid = await _canonical_guid(ctx, chat_guid, for_send=True)
     await _guard(ctx).check_chat(chat_guid)
     await _check_freshness(ctx, chat_guid)
     data = await _bb(ctx).send_message(
@@ -771,7 +763,7 @@ async def send_multipart(
         chat_guid: The chat GUID to send to.
         parts: Ordered list of text and/or attachment parts (see above).
     """
-    chat_guid = await _canonical_guid(ctx, chat_guid)
+    chat_guid = await _canonical_guid(ctx, chat_guid, for_send=True)
     await _guard(ctx).check_chat(chat_guid)
     await _check_freshness(ctx, chat_guid)
     assembled: list[dict[str, Any]] = []
@@ -1291,7 +1283,7 @@ async def send_attachment(
         filename: The filename (e.g. 'photo.jpg').
         mime_type: MIME type (e.g. 'image/jpeg'). Defaults to 'application/octet-stream'.
     """
-    chat_guid = await _canonical_guid(ctx, chat_guid)
+    chat_guid = await _canonical_guid(ctx, chat_guid, for_send=True)
     await _guard(ctx).check_chat(chat_guid)
     await _check_freshness(ctx, chat_guid)
     file_data = base64.b64decode(data_base64)
