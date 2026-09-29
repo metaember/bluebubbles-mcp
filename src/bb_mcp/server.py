@@ -40,6 +40,11 @@ from bb_mcp.projection import filter_by_sender, project
 
 logger = logging.getLogger(__name__)
 
+# BlueBubbles requires a password in every request URL. httpx logs full URLs at
+# INFO, and httpcore can do so at DEBUG; suppress their transport logs entirely.
+logging.getLogger("httpx").setLevel(logging.CRITICAL + 1)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL + 1)
+
 # ---------------------------------------------------------------------------
 # Annotations
 # ---------------------------------------------------------------------------

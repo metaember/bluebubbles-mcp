@@ -36,38 +36,48 @@ class BlueBubblesClient:
     @staticmethod
     def _unwrap(resp: httpx.Response) -> Any:
         """Raise on HTTP/API errors, else return the response's ``data`` field."""
-        resp.raise_for_status()
         body = resp.json()
-        if body.get("status") and body["status"] >= 400:
-            raise BlueBubblesError(body.get("message", "Unknown error"), body)
+        if isinstance(body.get("status"), int) and body["status"] >= 400:
+            # Provider messages can echo request URLs, including the password.
+            raise BlueBubblesError(f"BlueBubbles API error (status {body['status']})")
         return body.get("data")
 
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Keep credential-bearing httpx exceptions inside the client boundary."""
+        try:
+            resp = await self._http.request(
+                method,
+                self._url(path),
+                params=self._auth_params(kwargs.pop("params", None)),
+                **kwargs,
+            )
+        except (httpx.RequestError, httpx.InvalidURL):
+            # httpx exception strings can include the full password query URL.
+            resp = None
+        if resp is None:
+            raise BlueBubblesError("BlueBubbles request failed")
+        if not 200 <= resp.status_code < 300:
+            raise BlueBubblesError(f"BlueBubbles HTTP {resp.status_code}")
+        return resp
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        resp = await self._http.get(
-            self._url(path), params=self._auth_params(params)
-        )
+        resp = await self._request("GET", path, params=params)
         return self._unwrap(resp)
 
     async def _post(
         self, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None
     ) -> Any:
-        resp = await self._http.post(
-            self._url(path), json=json, params=self._auth_params(params)
-        )
+        resp = await self._request("POST", path, json=json, params=params)
         return self._unwrap(resp)
 
     async def _delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        resp = await self._http.delete(
-            self._url(path), params=self._auth_params(params)
-        )
+        resp = await self._request("DELETE", path, params=params)
         return self._unwrap(resp)
 
     async def _put(
         self, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None
     ) -> Any:
-        resp = await self._http.put(
-            self._url(path), json=json, params=self._auth_params(params)
-        )
+        resp = await self._request("PUT", path, json=json, params=params)
         return self._unwrap(resp)
 
     # -- server ---------------------------------------------------------------
@@ -166,18 +176,14 @@ class BlueBubblesClient:
         return await self._delete(f"/chat/{chat_guid}/{message_guid}")
 
     async def get_group_icon(self, chat_guid: str) -> bytes:
-        resp = await self._http.get(
-            self._url(f"/chat/{chat_guid}/icon"), params=self._auth_params()
-        )
-        resp.raise_for_status()
+        resp = await self._request("GET", f"/chat/{chat_guid}/icon")
         return resp.content
 
     async def set_group_icon(
         self, chat_guid: str, file_data: bytes, filename: str, mime_type: str
     ) -> Any:
-        resp = await self._http.post(
-            self._url(f"/chat/{chat_guid}/icon"),
-            params=self._auth_params(),
+        resp = await self._request(
+            "POST", f"/chat/{chat_guid}/icon",
             files={"icon": (filename, file_data, mime_type)},
         )
         return self._unwrap(resp)
@@ -261,9 +267,8 @@ class BlueBubblesClient:
 
         Returns ``{"path": "<uuid>/<filename>"}`` to reference in a part.
         """
-        resp = await self._http.post(
-            self._url("/attachment/upload"),
-            params=self._auth_params(),
+        resp = await self._request(
+            "POST", "/attachment/upload",
             files={"attachment": (filename, file_data, mime_type)},
         )
         return self._unwrap(resp)
@@ -373,11 +378,11 @@ class BlueBubblesClient:
         return await self._get(f"/attachment/{attachment_guid}")
 
     async def download_attachment(self, attachment_guid: str) -> bytes:
-        resp = await self._http.get(
-            self._url(f"/attachment/{attachment_guid}/download"),
-            params=self._auth_params({"original": "true"}),
+        resp = await self._request(
+            "GET",
+            f"/attachment/{attachment_guid}/download",
+            params={"original": "true"},
         )
-        resp.raise_for_status()
         return resp.content
 
     async def send_attachment(
@@ -388,9 +393,8 @@ class BlueBubblesClient:
         mime_type: str = "application/octet-stream",
         method: str = "private-api",
     ) -> dict[str, Any]:
-        resp = await self._http.post(
-            self._url("/message/attachment"),
-            params=self._auth_params(),
+        resp = await self._request(
+            "POST", "/message/attachment",
             data={
                 "chatGuid": chat_guid,
                 "tempGuid": f"temp-{uuid.uuid4().hex}",
