@@ -19,6 +19,12 @@ uv sync
 
 ## Configuration
 
+BlueBubbles authenticates REST requests with a `password` query parameter.
+The MCP client does not forward HTTP exception text or provider error messages:
+those can contain the full request URL and its credential. Tool errors report
+the HTTP or API status, or a generic transport failure, instead. The server also
+disables httpx/httpcore request logging because it can include that URL.
+
 Add to your MCP client config (e.g. Claude Code `~/.claude/settings.json`):
 
 ```json

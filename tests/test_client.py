@@ -85,24 +85,64 @@ class TestInternalGet:
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
         mock_api.get(f"{API}/fail").mock(return_value=httpx.Response(500))
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(BlueBubblesError, match="BlueBubbles HTTP 500"):
             await client._get("/fail")
+
+    async def test_http_error_never_exposes_password_or_url(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        route = mock_api.get(f"{API}/chat/missing/message").mock(
+            return_value=httpx.Response(404)
+        )
+        with pytest.raises(BlueBubblesError) as exc_info:
+            await client._get("/chat/missing/message")
+        assert route.calls[0].request.url.params["password"] == PASSWORD
+        assert str(exc_info.value) == "BlueBubbles HTTP 404"
+        assert PASSWORD not in str(exc_info.value)
+        assert "bb.local" not in str(exc_info.value)
+
+    async def test_transport_error_never_exposes_password_or_url(
+        self, client: BlueBubblesClient, mock_api: respx.Router
+    ) -> None:
+        def fail(request: httpx.Request) -> None:
+            raise httpx.ConnectError(f"failed: {request.url}", request=request)
+
+        mock_api.get(f"{API}/ping").mock(side_effect=fail)
+        with pytest.raises(BlueBubblesError) as exc_info:
+            await client.ping()
+        assert str(exc_info.value) == "BlueBubbles request failed"
+        assert exc_info.value.__context__ is None
+        assert PASSWORD not in str(exc_info.value)
+        assert "bb.local" not in str(exc_info.value)
+
+    async def test_invalid_url_never_exposes_password(
+        self, client: BlueBubblesClient
+    ) -> None:
+        with patch.object(
+            client._http, "request",
+            side_effect=httpx.InvalidURL(f"{API}/ping?password={PASSWORD}"),
+        ):
+            with pytest.raises(BlueBubblesError) as exc_info:
+                await client.ping()
+        assert str(exc_info.value) == "BlueBubbles request failed"
+        assert exc_info.value.__context__ is None
 
     async def test_get_api_error_raises(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
         mock_api.get(f"{API}/bad").mock(return_value=api_error_json("Oops", api_status=400))
-        with pytest.raises(BlueBubblesError, match="Oops"):
+        with pytest.raises(BlueBubblesError, match="status 400"):
             await client._get("/bad")
 
-    async def test_get_api_error_attaches_body(
+    async def test_get_api_error_does_not_attach_provider_body(
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
-        body = {"status": 500, "message": "boom"}
+        body = {"status": 500, "message": f"failed at {API}/err?password={PASSWORD}"}
         mock_api.get(f"{API}/err").mock(return_value=httpx.Response(200, json=body))
         with pytest.raises(BlueBubblesError) as exc_info:
             await client._get("/err")
-        assert exc_info.value.response_body == body
+        assert str(exc_info.value) == "BlueBubbles API error (status 500)"
+        assert exc_info.value.response_body is None
 
 
 class TestInternalPost:
@@ -118,7 +158,7 @@ class TestInternalPost:
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
         mock_api.post(f"{API}/action").mock(return_value=api_error_json("fail", api_status=422))
-        with pytest.raises(BlueBubblesError, match="fail"):
+        with pytest.raises(BlueBubblesError, match="status 422"):
             await client._post("/action")
 
 
@@ -134,7 +174,7 @@ class TestInternalDelete:
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
         mock_api.delete(f"{API}/thing/1").mock(return_value=api_error_json("nope", api_status=403))
-        with pytest.raises(BlueBubblesError, match="nope"):
+        with pytest.raises(BlueBubblesError, match="status 403"):
             await client._delete("/thing/1")
 
 
@@ -152,7 +192,7 @@ class TestInternalPut:
         self, client: BlueBubblesClient, mock_api: respx.Router
     ) -> None:
         mock_api.put(f"{API}/item").mock(return_value=api_error_json("bad", api_status=400))
-        with pytest.raises(BlueBubblesError, match="bad"):
+        with pytest.raises(BlueBubblesError, match="status 400"):
             await client._put("/item")
 
 
@@ -524,7 +564,7 @@ class TestAttachments:
         mock_api.get(f"{API}/attachment/att1/download").mock(
             return_value=httpx.Response(404)
         )
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(BlueBubblesError, match="BlueBubbles HTTP 404"):
             await client.download_attachment("att1")
 
 
