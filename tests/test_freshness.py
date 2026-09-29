@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -21,8 +22,10 @@ from bb_mcp.server import (
     _check_freshness,
     _record_watermark,
     create_chat,
+    get_chat_alias_messages,
     get_chat_messages,
     get_unread_chats,
+    list_chat_aliases,
     mcp,
     send_attachment,
     send_message,
@@ -166,13 +169,17 @@ class FakeBB:
         self._chats = chats or []
         self.views = views or {}  # per-guid message sets (aliases differ)
         self.sent: list[tuple] = []
+        self.read_guids: list[str] = []
+        self.list_calls: list[dict] = []
 
     async def get_chat_messages(self, chat_guid: str, **kwargs) -> list[dict]:
         if self.raise_on_get:
             raise BlueBubblesError("chat not found", {})
+        self.read_guids.append(chat_guid)
         return self.views.get(chat_guid, self.messages)
 
     async def list_chats(self, **kwargs) -> list[dict]:
+        self.list_calls.append(kwargs)
         offset = kwargs.get("offset", 0)
         return self._chats[offset:offset + kwargs.get("limit", len(self._chats))]
 
@@ -484,7 +491,6 @@ class TestSessionModeFlow:
             await send_message(ctx, "chat-A", "hi")
         assert bb.sent == []
 
-
 class TestCreateChat:
     """create_chat is for NEW conversations only: with the guard on it refuses to
     reach an existing 1:1 chat (closing the address-path bypass) and points the agent
@@ -616,6 +622,7 @@ class TestAliasResolutionIntegration:
             await send_message(ctx, "iMessage;-;+15550999", "hi")
         assert bb.sent == []
 
+
     async def test_unresolved_alias_cannot_borrow_live_watermark(self) -> None:
         tracker = FreshnessTracker(clock=FakeClock())
         bb = FakeBB(
@@ -666,6 +673,49 @@ class TestAliasResolutionIntegration:
         with pytest.raises(FreshnessError):
             await send_message(ctx, self.CANON, "hi")
         assert bb.sent == []
+
+
+class TestArchivalAliasReads:
+    """The archival surface preserves physical rows without weakening send safety."""
+
+    async def test_lists_raw_alias_rows_without_deduplication(self) -> None:
+        chats = [
+            {"guid": "iMessage;-;+15550100"},
+            {"guid": "SMS;-;+15550100"},
+        ]
+        bb = FakeBB([], chats=chats)
+        ctx = make_ctx(bb=bb, identity="session")
+
+        data = await list_chat_aliases(ctx, limit=2, offset=0, extended=True)
+
+        assert [row["guid"] for row in json.loads(data)] == [
+            "iMessage;-;+15550100",
+            "SMS;-;+15550100",
+        ]
+        assert bb.list_calls == [{
+            "limit": 2,
+            "offset": 0,
+            "with_fields": ["participants", "lastmessage"],
+        }]
+
+    async def test_exact_alias_read_does_not_record_send_watermark(self) -> None:
+        stale = "SMS;-;+15550100"
+        live = "iMessage;-;+15550100"
+        tracker = FreshnessTracker(clock=FakeClock())
+        bb = FakeBB([], views={stale: [{"guid": "old", "isFromMe": False,
+                                       "dateCreated": 100}]})
+        ctx = make_ctx(
+            bb=bb,
+            freshness=tracker,
+            identity="session",
+            resolver=FakeResolver(canonical={stale: live}),
+        )
+
+        await get_chat_alias_messages(ctx, stale, extended=True)
+
+        assert bb.read_guids == [stale]
+        with pytest.raises(FreshnessError):
+            tracker.last_seen("session", stale)
 
 
 class TestOtherGatedSends:

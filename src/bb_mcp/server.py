@@ -472,6 +472,33 @@ async def list_chats(
 
 
 @mcp.tool(annotations=READ_ONLY)
+async def list_chat_aliases(
+    ctx: Context,
+    limit: int = 25,
+    offset: int = 0,
+    extended: bool = False,
+) -> str:
+    """List physical BlueBubbles chat rows without alias deduplication.
+
+    This archival read surface exposes the separate iMessage, SMS, RCS, ``any``,
+    and iMessageLite rows that Apple may present as one conversation. Normal agents
+    should use ``list_chats``; this tool exists for trusted history indexers that
+    must recover messages stored only on an older transport row.
+
+    Args:
+        limit: Max physical chat rows to return (default 25).
+        offset: Raw-row pagination offset.
+        extended: Return full raw fields instead of the compact set (default False).
+    """
+    data = await _bb(ctx).list_chats(
+        limit=limit,
+        offset=offset,
+        with_fields=["participants", "lastmessage"],
+    )
+    return _fmt(project(data, extended))
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def get_chat(ctx: Context, chat_guid: str, extended: bool = False) -> str:
     """Get details for a specific chat, including participants.
 
@@ -521,6 +548,44 @@ async def get_chat_messages(
     return await _present_messages(
         ctx, data, extended=extended, from_address=from_address, limit=limit
     )
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_chat_alias_messages(
+    ctx: Context,
+    chat_guid: str,
+    limit: int = 25,
+    offset: int = 0,
+    sort: str = "DESC",
+    after: int | None = None,
+    before: int | None = None,
+    extended: bool = False,
+) -> str:
+    """Read one exact physical chat row without canonical alias resolution.
+
+    This is the companion archival tool to ``list_chat_aliases``. It deliberately
+    does not update the send-freshness watermark: reading a stale physical alias
+    must never authorize a send. Normal conversational reads should use
+    ``get_chat_messages`` instead.
+
+    Args:
+        chat_guid: Exact physical chat GUID returned by ``list_chat_aliases``.
+        limit: Max messages to return (default 25).
+        offset: Pagination offset within that physical row.
+        sort: 'ASC' or 'DESC' (default DESC = newest first).
+        after: Only messages after this epoch-ms timestamp.
+        before: Only messages before this epoch-ms timestamp.
+        extended: Return full raw fields instead of the compact set (default False).
+    """
+    data = await _bb(ctx).get_chat_messages(
+        chat_guid,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+        after=after,
+        before=before,
+    )
+    return _fmt(project(data, extended))
 
 
 @mcp.tool(annotations=READ_ONLY)

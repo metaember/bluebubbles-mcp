@@ -78,6 +78,20 @@ Wired into `server.py`:
 - **`list_chats` / `find_chats`** dedupe alias rows (`dedupe_chats`). `list_chats`
   applies offset and limit after deduplication, so pages do not repeat aliases.
 
+### Archival reads
+
+Canonical reads are the right default for an assistant, but they cannot recover history
+that exists only on an older physical SMS/RCS/iMessage row. Two separately named,
+read-only tools preserve that capability for trusted indexers:
+
+- **`list_chat_aliases`** paginates physical BlueBubbles chat rows without
+  deduplication.
+- **`get_chat_alias_messages`** reads the exact supplied physical GUID without alias
+  resolution and does not advance the freshness watermark used to authorize sends.
+
+These tools should be withheld from ordinary agent profiles and granted only to archival
+consumers. All send tools remain forcibly canonicalized.
+
 ### Fail-closed guarantees (preserved)
 
 - An unresolved GUID keys on its **raw self** for freshness. A read of another alias
@@ -96,3 +110,4 @@ Wired into `server.py`:
   The guard also cannot close the interval between its final check and the send without
   an atomic BlueBubbles API operation.
 - **Group aliasing** across services (rare) is not resolved; groups retain their GUID.
+  Archival consumers can still inspect each physical group row through the alias tools.
