@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -928,6 +928,7 @@ async def search_messages(
     before: int | None = None,
     from_address: str | None = None,
     extended: bool = False,
+    sort: Literal["ASC", "DESC"] = "DESC",
 ) -> str:
     """Search messages by text content and/or filter by chat and time range.
 
@@ -936,6 +937,7 @@ async def search_messages(
         chat_guid: Limit search to a specific chat.
         limit: Max results (default 25).
         offset: Pagination offset.
+        sort: 'ASC' for oldest first, 'DESC' for newest first (default).
         after: Only messages after this epoch-ms timestamp.
         before: Only messages before this epoch-ms timestamp.
         from_address: Only messages sent by this phone/email. Pass 'me' for the
@@ -945,6 +947,7 @@ async def search_messages(
     data = await _bb(ctx).search_messages(
         query=query, chat_guid=chat_guid, limit=_fetch_limit(limit, from_address),
         offset=offset, after=after, before=before,
+        sort=sort,
     )
     return await _present_messages(
         ctx, data, extended=extended, from_address=from_address, limit=limit
