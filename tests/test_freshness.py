@@ -675,6 +675,42 @@ class TestAliasResolutionIntegration:
         assert bb.sent == []
 
 
+class TestCompleteCatalogueRouting:
+    async def test_later_page_routes_read_and_guarded_send_to_populated_row(self):
+        num = "+15550123"
+        empty, live = f"RCS;-;{num}", f"iMessage;-;{num}"
+        rows = [{"guid": empty, "lastMessage": None}]
+        rows += [{"guid": f"iMessage;-;+1999{i:04d}"} for i in range(999)]
+        rows += [{"guid": live, "lastMessage": {"dateCreated": 900}}]
+        bb = FakeBB([], views={live: [{"guid": "latest", "dateCreated": 900,
+                                       "isFromMe": False}]}, chats=rows)
+        ctx = make_ctx(identity="session", bb=bb, freshness=FreshnessTracker(),
+                       resolver=ChatResolver(bb, str.lower))
+        result = json.loads(await get_chat_messages(ctx, empty))
+        assert result[0]["guid"] == "latest"
+        assert bb.read_guids == [live]
+        await send_message(ctx, empty, "synthetic test")
+        assert bb.sent == [(live, "synthetic test")]
+        assert [c["offset"] for c in bb.list_calls] == [0, 1000, 1001] * 2
+
+    @pytest.mark.parametrize("guarded", [True, False])
+    async def test_partial_read_falls_back_exact_but_cannot_authorize_send(self, guarded):
+        class Broken(FakeBB):
+            async def list_chats(self, **kwargs):
+                return None if kwargs.get("offset") else self._chats
+        num = "+15550123"
+        empty, live = f"RCS;-;{num}", f"iMessage;-;{num}"
+        bb = Broken([], chats=[{"guid": empty}],
+                    views={live: [{"guid": "latest", "dateCreated": 900}]})
+        ctx = make_ctx(identity="session", bb=bb, freshness=FreshnessTracker() if guarded else None,
+                       resolver=ChatResolver(bb, str.lower))
+        assert json.loads(await get_chat_messages(ctx, live))[0]["guid"] == "latest"
+        assert bb.read_guids == [live]
+        with pytest.raises(FreshnessError, match="Could not verify"):
+            await send_message(ctx, live, "must not send")
+        assert bb.sent == []
+
+
 class TestArchivalAliasReads:
     """The archival surface preserves physical rows without weakening send safety."""
 

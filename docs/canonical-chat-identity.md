@@ -59,9 +59,10 @@ Two pieces, in `bb_mcp/chats.py`:
 2. **`ChatResolver`** — resolves an alias GUID to the **live canonical chat**: among the
    participant's rows, the most recent, breaking ties by service preference
    (`iMessage`/`any` > `iMessageLite` > `RCS` > `SMS`). Built from one `/chat/query`
-   enumeration, cached ~60s for reads. A guarded send refreshes that enumeration so
-   newly active aliases are considered. A GUID outside the first page can still use
-   the known mapping for its embedded address; otherwise it resolves to itself.
+   complete paginated enumeration, cached ~60s for reads. Every send refreshes
+   the complete enumeration so newly active aliases are considered. The map is
+   published atomically only after an empty terminal page. Short pages alone are
+   not proof of completion: servers may clamp the requested page size.
 
 Wired into `server.py`:
 
@@ -71,9 +72,9 @@ Wired into `server.py`:
   check and the send, so they compare and deliver against the canonical chat.
 - **Freshness** keys on the resolved GUID. Known aliases converge on one row and share
   its watermark; an unresolved alias keeps a separate watermark and requires its own
-  read. A guarded send stops if the resolver cannot refresh.
+  read. Every send stops if the resolver cannot refresh, even with freshness disabled.
 - **`create_chat`** checks existence via `ChatResolver.find_for_address` (participant
-  match), refreshing its map and paging past the first 1000 rows on a miss. It refuses
+  match), refreshing its complete map, even when the first page contains a match. It refuses
   an existing chat under any service alias and stops if the lookup fails.
 - **`list_chats` / `find_chats`** dedupe alias rows (`dedupe_chats`). `list_chats`
   applies offset and limit after deduplication, so pages do not repeat aliases.
@@ -96,15 +97,26 @@ consumers. All send tools remain forcibly canonicalized.
 
 - An unresolved GUID keys on its **raw self** for freshness. A read of another alias
   cannot authorize a send through it.
-- Resolver errors fall back to the input GUID for reads; guarded sends stop instead.
+- Resolver errors fall back to the input GUID for reads; all sends stop instead.
 - A guarded send refreshes alias selection before comparing the watermark. If another
   row became the most recent, its different GUID requires a re-read.
 
-## Residual edges (documented, not bugs)
+### Incomplete-catalogue regression
 
-- **The alias map covers the 1000 most recently active chats.** Older GUIDs resolve
-  through a known address when possible, or keep their raw identity. The `create_chat`
-  existence check continues through older pages before allowing a first-contact send.
+An empty RCS row can occur in the first 1000 results while populated iMessage/SMS
+aliases occur later. Publishing just page one incorrectly routed reads to the empty
+row. The resolver now enumerates all pages for both canonical reads and existence
+checks. Missing/malformed pages, duplicate GUIDs (including repeated pages), and
+the 100-page safety budget fail without publishing a partial map. Reads fall back
+to their exact requested GUID; all sends fail closed. No pagination failure is
+interpreted as proof that a person has no existing conversation.
+
+## Residual edges
+
+- **The upstream API has no snapshot cursor.** Concurrent chat reordering can move
+  rows across offset pages. Duplicate GUIDs are rejected, but a moving window that
+  omits a row without duplicating another cannot be conclusively detected. The
+  100-page budget is a failure boundary, never a partial-success boundary.
 - **The live freshness check reads the selected row.** If two independently active
   services have messages with equal timestamps, selection may still prefer one row.
   The guard also cannot close the interval between its final check and the send without

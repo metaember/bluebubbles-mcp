@@ -12,7 +12,9 @@ from typing import Any, Literal, Mapping
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ToolAnnotations
+
+from bb_mcp.attachments import attachment_result
 
 from bb_mcp.capabilities import (
     PRIVATE_API_TOOLS,
@@ -227,16 +229,16 @@ def _resolver(ctx: Context) -> ChatResolver | None:
 async def _canonical_guid(ctx: Context, chat_guid: str, *, for_send: bool = False) -> str:
     """Resolve an alias GUID (iMessageLite/any/SMS/...) to the live canonical chat,
     so reads and sends land on the real thread, not a stale shadow row. Refresh the
-    mapping before guarded sends so a newly active alias cannot be missed."""
+    mapping before every send so a newly active alias cannot be missed."""
     resolver = _resolver(ctx)
     if resolver is None:
         return chat_guid
     try:
         return await resolver.canonical_guid(
-            chat_guid, refresh=for_send and _freshness(ctx) is not None
+            chat_guid, refresh=for_send
         )
     except BlueBubblesError:
-        if for_send and _freshness(ctx) is not None:
+        if for_send:
             raise FreshnessError(
                 "Could not verify the current conversation. Read it again before sending."
             ) from None
@@ -1319,20 +1321,21 @@ async def get_attachment_info(ctx: Context, attachment_guid: str) -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def download_attachment(ctx: Context, attachment_guid: str) -> str:
-    """Download an attachment and return it as base64-encoded data.
+async def download_attachment(
+    ctx: Context, attachment_guid: str, original: bool = False,
+) -> CallToolResult:
+    """Download an attachment as an MCP image or embedded binary resource (max 50 MiB).
+
+    Returns small filename/type/size metadata plus one binary content block, not
+    base64 inside JSON text. Format is identified from the downloaded bytes.
 
     Args:
         attachment_guid: The attachment GUID.
+        original: Request original bytes instead of the server's converted image.
     """
-    data = await _bb(ctx).download_attachment(attachment_guid)
+    data = await _bb(ctx).download_attachment(attachment_guid, original=original)
     meta = await _bb(ctx).get_attachment(attachment_guid)
-    return _fmt({
-        "filename": meta.get("transferName"),
-        "mime_type": meta.get("mimeType"),
-        "size_bytes": len(data),
-        "data_base64": base64.b64encode(data).decode(),
-    })
+    return attachment_result(attachment_guid, data, meta or {})
 
 
 @mcp.tool(annotations=SEND)

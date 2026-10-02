@@ -38,6 +38,7 @@ _DEFAULT_RANK = 4
 
 DEFAULT_RESOLVE_TTL_SECONDS = 60.0
 _RESOLVE_PAGE_SIZE = 1000
+_RESOLVE_MAX_PAGES = 100
 _LIST_PAGE_SIZE = 100
 
 
@@ -144,7 +145,6 @@ class ChatResolver:
         self._guid_to_canonical: dict[str, str] = {}
         self._addr_to_canonical: dict[str, str] = {}
         self._built_at: float | None = None
-        self._first_page_full = False
         self._lock = asyncio.Lock()
 
     def _is_cache_fresh(self) -> bool:
@@ -156,17 +156,34 @@ class ChatResolver:
         async with self._lock:
             if not force and self._is_cache_fresh():  # built while we waited
                 return
-            chats = await self._client.list_chats(
-                limit=_RESOLVE_PAGE_SIZE,
-                sort="lastmessage",
-                with_fields=["participants", "lastmessage"],
-            )
-            if chats is None:
-                if force:
+            # Never publish a prefix of the catalogue. Empty service rows can
+            # sort ahead of populated aliases, even with sort="lastmessage".
+            # Read until an empty page (servers may clamp the requested limit).
+            chats: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for _ in range(_RESOLVE_MAX_PAGES):
+                page = await self._client.list_chats(
+                    limit=_RESOLVE_PAGE_SIZE,
+                    offset=len(chats),
+                    sort="lastmessage",
+                    with_fields=["participants", "lastmessage"],
+                )
+                if not isinstance(page, list):
                     raise BlueBubblesError("Chat enumeration unavailable")
-                chats = []
-            self._first_page_full = len(chats) == _RESOLVE_PAGE_SIZE
-            self._rebuild(chats)
+                if not page:
+                    self._rebuild(chats)
+                    return
+                for chat in page:
+                    guid = chat.get("guid") if isinstance(chat, dict) else None
+                    if not isinstance(guid, str) or not guid:
+                        raise BlueBubblesError("Invalid chat enumeration")
+                    if guid in seen:
+                        # A repeated page or a moving offset window isn't a
+                        # complete snapshot. Retry on the next call, not forever.
+                        raise BlueBubblesError("Unstable chat enumeration")
+                    seen.add(guid)
+                chats.extend(page)
+            raise BlueBubblesError("Chat enumeration budget exhausted")
 
     def _rebuild(self, chats: list[dict[str, Any]]) -> None:
         by_addr: dict[str, list[dict[str, Any]]] = {}
@@ -225,26 +242,4 @@ class ChatResolver:
         or ``None`` if the person has no chat yet (so a new one may be started)."""
         await self._ensure_fresh(force=refresh)
         normalized = self._normalize(address)
-        known = self._addr_to_canonical.get(normalized)
-        if known or not self._first_page_full:
-            return known
-
-        # An old conversation may be past the first page. `create_chat` must not
-        # treat a truncated enumeration as proof that it is a first contact.
-        offset = _RESOLVE_PAGE_SIZE
-        while True:
-            page = await self._client.list_chats(
-                limit=_RESOLVE_PAGE_SIZE,
-                offset=offset,
-                sort="lastmessage",
-                with_fields=["participants", "lastmessage"],
-            )
-            if page is None:
-                raise BlueBubblesError("Chat enumeration unavailable")
-            for chat in page:
-                guid = chat.get("guid") or ""
-                if _is_one_to_one(guid) and self._chat_address(chat, guid) == normalized:
-                    return guid
-            if len(page) < _RESOLVE_PAGE_SIZE:
-                return None
-            offset += len(page)
+        return self._addr_to_canonical.get(normalized)
