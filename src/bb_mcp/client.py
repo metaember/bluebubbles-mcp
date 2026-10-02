@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
 
 class BlueBubblesClient:
     """Thin async wrapper around the BlueBubbles v1 REST API.
@@ -377,13 +379,31 @@ class BlueBubblesClient:
     async def get_attachment(self, attachment_guid: str) -> dict[str, Any]:
         return await self._get(f"/attachment/{attachment_guid}")
 
-    async def download_attachment(self, attachment_guid: str) -> bytes:
-        resp = await self._request(
-            "GET",
-            f"/attachment/{attachment_guid}/download",
-            params={"original": "true"},
-        )
-        return resp.content
+    async def download_attachment(self, attachment_guid: str, *, original: bool = False) -> bytes:
+        """Bound downloads before buffering; prefer the server's converted image.
+
+        Do not trust attachment metadata to describe these bytes. The presentation
+        layer identifies supported formats from their signatures.
+        """
+        try:
+            async with self._http.stream(
+                "GET", self._url(f"/attachment/{attachment_guid}/download"),
+                params=self._auth_params({"original": str(original).lower()}),
+            ) as resp:
+                if not 200 <= resp.status_code < 300:
+                    raise BlueBubblesError(f"BlueBubbles HTTP {resp.status_code}")
+                size = resp.headers.get("content-length", "")
+                if size.isdigit() and int(size) > MAX_ATTACHMENT_BYTES:
+                    raise BlueBubblesError("Attachment exceeds the 50 MiB download limit")
+                data = bytearray()
+                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                    if len(data) + len(chunk) > MAX_ATTACHMENT_BYTES:
+                        raise BlueBubblesError("Attachment exceeds the 50 MiB download limit")
+                    data.extend(chunk)
+                return bytes(data)
+        except (httpx.RequestError, httpx.InvalidURL):
+            # Never surface URLs containing the provider password.
+            raise BlueBubblesError("BlueBubbles attachment request failed") from None
 
     async def send_attachment(
         self,

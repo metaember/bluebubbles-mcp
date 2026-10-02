@@ -556,7 +556,30 @@ class TestAttachments:
         assert result == raw
         params = route.calls[0].request.url.params
         assert params.get("password") == PASSWORD
-        assert params.get("original") == "true"
+        assert params.get("original") == "false"
+
+    async def test_original_download_is_explicit(self, client, mock_api):
+        route = mock_api.get(f"{API}/attachment/att1/download").mock(
+            return_value=httpx.Response(200, content=b"original"))
+        assert await client.download_attachment("att1", original=True) == b"original"
+        assert route.calls[0].request.url.params["original"] == "true"
+
+    @pytest.mark.parametrize("with_length", [False, True])
+    async def test_download_size_bound(self, client, mock_api, monkeypatch, with_length):
+        monkeypatch.setattr("bb_mcp.client.MAX_ATTACHMENT_BYTES", 3)
+        response = httpx.Response(200, content=b"toolarge")
+        if not with_length:
+            del response.headers["content-length"]
+        mock_api.get(f"{API}/attachment/att1/download").mock(return_value=response)
+        with pytest.raises(BlueBubblesError, match="download limit"):
+            await client.download_attachment("att1")
+
+    async def test_download_transport_error_redacts_password(self, client, mock_api):
+        mock_api.get(f"{API}/attachment/att1/download").mock(
+            side_effect=httpx.ConnectError(f"https://example.test?password={PASSWORD}"))
+        with pytest.raises(BlueBubblesError) as error:
+            await client.download_attachment("att1")
+        assert PASSWORD not in str(error.value)
 
     async def test_download_attachment_http_error(
         self, client: BlueBubblesClient, mock_api: respx.Router

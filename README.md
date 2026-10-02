@@ -221,7 +221,7 @@ correct in both 1:1 and group chats.
 | `get_recent_messages` | Messages from last N minutes across all chats | read-only |
 | `get_unread_chats` | Chats with unread messages + their latest messages | read-only |
 | `get_attachment_info` | Attachment metadata | read-only |
-| `download_attachment` | Download attachment as base64 | read-only |
+| `download_attachment` | Download as an MCP image or embedded binary resource (50 MiB max) | read-only |
 | `get_group_icon` | Download a group chat's icon | read-only |
 | `mark_chat_read` | Send read receipt | idempotent, open-world |
 | `mark_chat_unread` | Mark chat unread (local) | idempotent |

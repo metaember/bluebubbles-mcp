@@ -124,7 +124,7 @@ class TestChatResolver:
         await r.canonical_guid("iMessage;-;+15550004")
         await r.canonical_guid("iMessage;-;+15550004")
         await r.find_for_address("+15550004")
-        assert client.list_calls == 1  # one enumeration reused
+        assert client.list_calls == 2  # one complete enumeration reused (including EOF)
 
     async def test_enumeration_refreshes_after_ttl(self) -> None:
         client = FakeClient([chat("iMessage;-;+15550005", "+15550005", 1)])
@@ -133,14 +133,16 @@ class TestChatResolver:
         await r.canonical_guid("iMessage;-;+15550005")
         clock.advance(61)
         await r.canonical_guid("iMessage;-;+15550005")
-        assert client.list_calls == 2
+        assert client.list_calls == 4
 
     async def test_none_enumeration_is_fail_safe(self) -> None:
-        # list_chats can return None on an edge response; resolve to self, don't crash.
+        # Unavailable is not an authoritative empty catalogue.
         client = FakeClient(None)  # type: ignore[arg-type]
         r = ChatResolver(client, NORM, clock=FakeClock())
-        assert await r.canonical_guid("iMessage;-;+15550006") == "iMessage;-;+15550006"
-        assert await r.find_for_address("+15550006") is None
+        with pytest.raises(BlueBubblesError, match="enumeration unavailable"):
+            await r.canonical_guid("iMessage;-;+15550006")
+        with pytest.raises(BlueBubblesError, match="enumeration unavailable"):
+            await r.find_for_address("+15550006")
 
     async def test_forced_refresh_rejects_missing_enumeration(self) -> None:
         client = FakeClient(None)  # type: ignore[arg-type]
@@ -165,7 +167,7 @@ class TestChatResolver:
         assert await r.canonical_guid(live["guid"]) == live["guid"]
         newly_active["lastMessage"]["dateCreated"] = 950
         assert await r.canonical_guid(live["guid"], refresh=True) == newly_active["guid"]
-        assert client.list_calls == 2
+        assert client.list_calls == 4
 
     async def test_find_for_address_searches_beyond_first_thousand(self) -> None:
         filler = [chat(f"iMessage;-;+1999{i:04d}", f"+1999{i:04d}", 2000 - i)
@@ -174,7 +176,7 @@ class TestChatResolver:
         client = FakeClient(filler + [target])
         r = ChatResolver(client, NORM, clock=FakeClock())
         assert await r.find_for_address("+15550011") == target["guid"]
-        assert client.list_calls == 2
+        assert client.list_calls == 3
 
     async def test_find_for_address_refreshes_cached_absence(self) -> None:
         client = FakeClient([])
@@ -183,7 +185,68 @@ class TestChatResolver:
         new_chat = chat("iMessage;-;+15550012", "+15550012", 100)
         client.chats = [new_chat]
         assert await r.find_for_address("+15550012", refresh=True) == new_chat["guid"]
-        assert client.list_calls == 2
+        assert client.list_calls == 3
+
+    async def test_empty_first_page_alias_cannot_hide_populated_later_row(self):
+        address = "+15550013"
+        empty = chat(f"RCS;-;{address}", address, 0)
+        filler = [chat(f"iMessage;-;+1999{i:04d}", f"+1999{i:04d}", 1)
+                  for i in range(999)]
+        live = chat(f"iMessage;-;{address}", address, 900)
+        r = ChatResolver(FakeClient([empty, *filler, live]), NORM)
+        for service in ("iMessage", "SMS", "iMessageLite", "RCS"):
+            assert await r.canonical_guid(f"{service};-;{address}") == live["guid"]
+        assert await r.find_for_address(address) == live["guid"]
+
+    async def test_short_server_clamped_pages_are_not_eof(self):
+        class Clamped(FakeClient):
+            async def list_chats(self, **kwargs):
+                return await super().list_chats(**{**kwargs, "limit": 1})
+        rows = [chat("RCS;-;+15550013", "+15550013", 0),
+                chat("iMessage;-;+15550013", "+15550013", 900)]
+        client = Clamped(rows)
+        r = ChatResolver(client, NORM)
+        assert await r.canonical_guid(rows[0]["guid"]) == rows[1]["guid"]
+        assert client.list_calls == 3
+
+    @pytest.mark.parametrize("bad", [None, {}, [{}], [{"guid": 123}]])
+    async def test_invalid_later_page_does_not_publish_prefix(self, bad):
+        class Broken(FakeClient):
+            async def list_chats(self, **kwargs):
+                return bad if kwargs.get("offset") else self.chats
+        row = chat("RCS;-;+15550013", "+15550013", 0)
+        r = ChatResolver(Broken([row]), NORM)
+        with pytest.raises(BlueBubblesError):
+            await r.canonical_guid("iMessage;-;+15550013")
+        assert r._built_at is None
+        assert r._addr_to_canonical == {}
+
+    async def test_repeated_page_fails_instead_of_looping(self):
+        class Repeating(FakeClient):
+            async def list_chats(self, **kwargs):
+                return self.chats
+        r = ChatResolver(Repeating([chat("RCS;-;+15550013", "+15550013", 0)]), NORM)
+        with pytest.raises(BlueBubblesError, match="Unstable"):
+            await r.find_for_address("+15559999", refresh=True)
+
+    async def test_page_budget_fails_without_partial_cache(self, monkeypatch):
+        monkeypatch.setattr("bb_mcp.chats._RESOLVE_MAX_PAGES", 1)
+        r = ChatResolver(FakeClient([chat("RCS;-;+15550013", "+15550013", 0)]), NORM)
+        with pytest.raises(BlueBubblesError, match="budget"):
+            await r.canonical_guid("iMessage;-;+15550013", refresh=True)
+        assert r._built_at is None
+
+    async def test_failed_refresh_never_replaces_last_complete_snapshot(self):
+        row = chat("iMessage;-;+15550013", "+15550013", 900)
+        client = FakeClient([row])
+        r = ChatResolver(client, NORM)
+        await r.canonical_guid(row["guid"])
+        before = r._built_at
+        client.chats = None
+        with pytest.raises(BlueBubblesError):
+            await r.canonical_guid(row["guid"], refresh=True)
+        assert r._built_at == before
+        assert r._addr_to_canonical == {"+15550013": row["guid"]}
 
 
 class TestDedupeChats:
