@@ -694,7 +694,7 @@ class TestCompleteCatalogueRouting:
         assert [c["offset"] for c in bb.list_calls] == [0, 1000, 1001] * 2
 
     @pytest.mark.parametrize("guarded", [True, False])
-    async def test_partial_read_falls_back_exact_but_cannot_authorize_send(self, guarded):
+    async def test_partial_catalogue_never_looks_like_an_empty_conversation(self, guarded):
         class Broken(FakeBB):
             async def list_chats(self, **kwargs):
                 return None if kwargs.get("offset") else self._chats
@@ -704,8 +704,9 @@ class TestCompleteCatalogueRouting:
                     views={live: [{"guid": "latest", "dateCreated": 900}]})
         ctx = make_ctx(identity="session", bb=bb, freshness=FreshnessTracker() if guarded else None,
                        resolver=ChatResolver(bb, str.lower))
-        assert json.loads(await get_chat_messages(ctx, live))[0]["guid"] == "latest"
-        assert bb.read_guids == [live]
+        with pytest.raises(BlueBubblesError, match="not an empty conversation"):
+            await get_chat_messages(ctx, live)
+        assert bb.read_guids == []
         with pytest.raises(FreshnessError, match="Could not verify"):
             await send_message(ctx, live, "must not send")
         assert bb.sent == []

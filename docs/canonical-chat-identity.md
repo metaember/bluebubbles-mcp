@@ -97,7 +97,9 @@ consumers. All send tools remain forcibly canonicalized.
 
 - An unresolved GUID keys on its **raw self** for freshness. A read of another alias
   cannot authorize a send through it.
-- Resolver errors fall back to the input GUID for reads; all sends stop instead.
+- Resolver errors stop normal reads with an explicit error, never a misleading empty
+  result. Exact physical-row reads remain available through the archival tool.
+- All sends stop on resolver errors, even with optional freshness disabled.
 - A guarded send refreshes alias selection before comparing the watermark. If another
   row became the most recent, its different GUID requires a re-read.
 
@@ -107,8 +109,8 @@ An empty RCS row can occur in the first 1000 results while populated iMessage/SM
 aliases occur later. Publishing just page one incorrectly routed reads to the empty
 row. The resolver now enumerates all pages for both canonical reads and existence
 checks. Missing/malformed pages, duplicate GUIDs (including repeated pages), and
-the 100-page safety budget fail without publishing a partial map. Reads fall back
-to their exact requested GUID; all sends fail closed. No pagination failure is
+the 100-page safety budget fail without publishing a partial map. Normal reads report
+an explicit resolution error; all sends fail closed. No pagination failure is
 interpreted as proof that a person has no existing conversation.
 
 ## Residual edges

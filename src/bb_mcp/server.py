@@ -242,8 +242,10 @@ async def _canonical_guid(ctx: Context, chat_guid: str, *, for_send: bool = Fals
             raise FreshnessError(
                 "Could not verify the current conversation. Read it again before sending."
             ) from None
-        logger.warning("Chat resolution failed for %s; using it unresolved", chat_guid)
-        return chat_guid
+        raise BlueBubblesError(
+            "Could not verify the current conversation: chat enumeration failed. "
+            "Retry the read; an unavailable catalogue is not an empty conversation."
+        ) from None
 
 
 def _freshness(ctx: Context) -> FreshnessTracker | None:
